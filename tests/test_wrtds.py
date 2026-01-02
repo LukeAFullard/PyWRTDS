@@ -67,5 +67,52 @@ class TestWRTDS(unittest.TestCase):
         # Basic check: output should be positive
         self.assertTrue(np.all(np.array(adjusted_series) > 0))
 
+    def test_gfn(self):
+        """Test Generalized Flow Normalization vs Stationary"""
+        # Create data where covariate has a strong trend
+        np.random.seed(42)
+        n = 1000 # ~3 years
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+
+        # Covariate doubles over time (Trend)
+        # Linear growth in log space
+        c0 = np.exp(np.linspace(0, 2, n) + np.random.normal(0, 0.2, n))
+
+        # Response is perfectly correlated with Covariate (no trend in beta0)
+        t0 = c0 * 10
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # 1. Stationary Normalization
+        # Integrates over ALL history (including low start and high end)
+        # Result should be constant average of C0 * 10
+        res_stat = dec.decant_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5})
+
+        # 2. Generalized (Windowed) Normalization (Window = 1 year)
+        # Integrates over local history. Since C0 is growing, the normalization
+        # base grows. So the "Decanted" result (which removes C0 effect)
+        # should technically strip the C0 trend if the model fits perfectly?
+        # Actually:
+        # Model: ln(Sales) = ln(10) + 1 * ln(AdSpend)
+        # SFN: Expectation over whole history of AdSpend. E[Sales] = 10 * E[AdSpend_all] = Constant.
+        # GFN: Expectation over local AdSpend. E[Sales] = 10 * E[AdSpend_local].
+        # Since AdSpend_local is increasing, GFN result will increase.
+        # This reflects that the "Expected State" of the system is increasing because the DRIVER is increasing.
+
+        res_gfn = dec.decant_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, gfn_window=1.0)
+
+        # Check that they are different
+        self.assertNotEqual(res_stat[0], res_gfn[0])
+
+        # Check trends
+        # SFN should be roughly flat (constant expectation)
+        slope_stat = np.polyfit(np.arange(n), res_stat, 1)[0]
+
+        # GFN should be positive (tracking the driver trend)
+        slope_gfn = np.polyfit(np.arange(n), res_gfn, 1)[0]
+
+        self.assertGreater(slope_gfn, slope_stat)
+
 if __name__ == '__main__':
     unittest.main()
