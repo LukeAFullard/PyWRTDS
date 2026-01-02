@@ -4,16 +4,18 @@ from datetime import datetime
 from scipy.interpolate import RegularGridInterpolator
 
 class Decanter:
-    def __init__(self, data, date_col, response_col, covariate_col):
+    def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None):
         """
         data: pandas DataFrame
         date_col: string name of date column
         response_col: string name of t0 (target)
         covariate_col: string name of c0 (driver)
+        extra_covariates: list of dicts, e.g. [{'col': 'Temp', 'log': False}]
         """
         self.orig_date_col = date_col
         self.orig_response_col = response_col
         self.orig_covariate_col = covariate_col
+        self.extra_cov_config = extra_covariates if extra_covariates else []
 
         self.df = data.copy()
 
@@ -33,11 +35,34 @@ class Decanter:
         self.df['log_response'] = np.log(self.df[response_col])
         self.df['log_covariate'] = np.log(self.df[covariate_col])
 
+        # Handle Extra Covariates
+        self.extra_cov_names = []
+        for conf in self.extra_cov_config:
+            col = conf['col']
+            is_log = conf.get('log', False) # Default to Linear space
+
+            if is_log:
+                if (self.df[col] <= 0).any():
+                    raise ValueError(f"Extra Covariate '{col}' contains non-positive values but log=True requested.")
+                name = f"log_{col}"
+                self.df[name] = np.log(self.df[col])
+            else:
+                name = f"lin_{col}"
+                self.df[name] = self.df[col] # Linear space
+
+            self.extra_cov_names.append(name)
+
         # Store vectors for fast vectorized access
         self.T = self.df['decimal_time'].values
         self.Q = self.df['log_covariate'].values
         self.S = self.df['season'].values
         self.Y = self.df['log_response'].values
+
+        # Matrix of Extra Covariates (N_samples x N_extras)
+        if self.extra_cov_names:
+            self.X_extras = self.df[self.extra_cov_names].values
+        else:
+            self.X_extras = None
 
     def _tricube(self, d, h):
         """
@@ -58,15 +83,15 @@ class Decanter:
         w[mask] = (1 - x[mask]**3)**3
         return w
 
-    def get_weights(self, t_target, q_target, s_target, h_time=7, h_cov=2, h_season=0.5):
+    def get_weights(self, t_target, q_target, s_target, h_params, extras_target=None):
         """
         Calculates the combined weight for all historical points relative to a
         single target point (t_target, q_target, s_target).
-
-        h_time: window in years (default 7)
-        h_cov: window in log-covariate units (default 2)
-        h_season: window in years (0.5 = 6 months)
         """
+        h_time = h_params.get('h_time', 7)
+        h_cov = h_params.get('h_cov', 2)
+        h_season = h_params.get('h_season', 0.5)
+
         # 1. Time Distance
         dist_t = self.T - t_target
         w_t = self._tricube(dist_t, h_time)
@@ -83,36 +108,57 @@ class Decanter:
         # Combine weights (Section 3.2)
         W = w_t * w_q * w_s
 
+        # 4. Extra Covariates
+        # extras_target must be a list of values corresponding to self.X_extras columns
+        if self.X_extras is not None and extras_target is not None:
+             for i, conf in enumerate(self.extra_cov_config):
+                 h_extra = h_params.get(f"h_{conf['col']}", 2) # Default window 2 units
+                 target_val = extras_target[i]
+                 obs_vals = self.X_extras[:, i]
+
+                 dist_ex = obs_vals - target_val
+                 w_ex = self._tricube(dist_ex, h_extra)
+
+                 W = W * w_ex
+
         return W
 
-    def fit_local_model(self, t_target, q_target, s_target, h_params):
+    def fit_local_model(self, t_target, q_target, s_target, h_params, extras_target=None):
         """
         Performs Weighted Least Squares for a specific target point.
-        Returns the coefficients [beta_0, beta_1, beta_2, beta_3, beta_4]
+        Returns the coefficients.
         """
         # Get weights
-        W = self.get_weights(t_target, q_target, s_target, **h_params)
+        W = self.get_weights(t_target, q_target, s_target, h_params, extras_target)
 
         # Filter out zero-weight points to speed up matrix math
         # Also ensure we only use valid (non-NaN) observations
         valid_obs = ~np.isnan(self.Y)
         mask = (W > 0) & valid_obs
 
-        if np.sum(mask) < 10: # Safety check for sparse data
+        # Dimension of model: 5 (Standard) + N_extras
+        n_extras = self.X_extras.shape[1] if self.X_extras is not None else 0
+        n_params = 5 + n_extras
+
+        # Heuristic: Need at least 2 * params data points? Or just > params
+        if np.sum(mask) < max(10, n_params + 2):
             return None
 
         weights_active = W[mask]
         y_active = self.Y[mask]
 
         # Construct Design Matrix X for the active points
-        # 1, ln(c0), t, sin, cos
+        # 1, ln(c0), t, sin, cos, [extra1, extra2...]
         n_active = np.sum(mask)
-        X = np.zeros((n_active, 5))
+        X = np.zeros((n_active, n_params))
         X[:, 0] = 1 # Intercept
         X[:, 1] = self.Q[mask] # log covariate
         X[:, 2] = self.T[mask] # decimal time
         X[:, 3] = np.sin(2 * np.pi * self.T[mask])
         X[:, 4] = np.cos(2 * np.pi * self.T[mask])
+
+        if n_extras > 0:
+            X[:, 5:] = self.X_extras[mask, :]
 
         # Solve WLS: (X.T * W * X)^-1 * X.T * W * Y
         # We use a diagonal weight matrix trick for numpy
@@ -126,7 +172,7 @@ class Decanter:
         except np.linalg.LinAlgError:
             return None
 
-    def predict_point(self, t_target, q_target, betas):
+    def predict_point(self, t_target, q_target, betas, extras_target=None):
         """
         Predicts value using the locally fitted betas.
         """
@@ -139,6 +185,13 @@ class Decanter:
                           betas[2] * t_target +
                           betas[3] * np.sin(2*np.pi*t_target) +
                           betas[4] * np.cos(2*np.pi*t_target))
+
+        # Add contributions from extra covariates
+        # extras_target: [val1, val2...]
+        if extras_target is not None:
+            # Betas for extras start at index 5
+            for i, val in enumerate(extras_target):
+                prediction_log += betas[5 + i] * val
 
         return np.exp(prediction_log) # Return to linear space
 
@@ -192,6 +245,11 @@ class Decanter:
         """
         results = []
 
+        # Grid not supported for WRTDSplus yet
+        if use_grid and self.X_extras is not None:
+            print("Warning: Grid optimization not supported for WRTDSplus (extra covariates). Falling back to Exact method.")
+            use_grid = False
+
         interpolator = None
         if use_grid:
             t_grid, q_grid, betas_grid = self.compute_grid(h_params, **grid_config)
@@ -218,6 +276,11 @@ class Decanter:
             s_current = row['season']
             q_current = row['log_covariate']
 
+            # Extract extras for this row if they exist
+            extras_current = None
+            if self.X_extras is not None:
+                extras_current = self.X_extras[i, :]
+
             betas = None
 
             if use_grid:
@@ -229,35 +292,54 @@ class Decanter:
                     betas = None
             else:
                 # Exact calculation
-                betas = self.fit_local_model(t_current, q_current, s_current, h_params)
+                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
 
             if betas is None:
                 results.append(np.nan)
                 continue
 
             # Flow Normalization (Integration)
-            # Formula: beta0 + beta1*Q_hist + beta2*t + ...
+            # Formula: beta0 + beta1*Q_hist + beta2*t + ... + beta_ext * Ext_hist
             const_part = (betas[0] +
                           betas[2] * t_current +
                           betas[3] * np.sin(2*np.pi*t_current) +
                           betas[4] * np.cos(2*np.pi*t_current))
 
             # Select historical covariates for integration
+            # We need both Q and X_extras for the same historical points
+
             if gfn_window is not None:
                 # Generalized Flow Normalization (Windowed)
                 h_window = gfn_window / 2
                 mask = np.abs(self.T - t_current) <= h_window
                 Q_integration = self.Q[mask]
+                if self.X_extras is not None:
+                    Extras_integration = self.X_extras[mask, :]
 
                 # If window is empty (shouldn't happen with reasonable data), fallback to full
                 if len(Q_integration) == 0:
                      Q_integration = self.Q
+                     if self.X_extras is not None:
+                         Extras_integration = self.X_extras
             else:
                 # Stationary Flow Normalization (Full Record)
                 Q_integration = self.Q
+                if self.X_extras is not None:
+                    Extras_integration = self.X_extras
 
             cov_part = betas[1] * Q_integration
-            predictions_log = const_part + cov_part
+
+            # Add Extra Covariates Contribution
+            extra_part = 0
+            if self.X_extras is not None:
+                # betas[5:] are for extras
+                # We need to dot product betas[5:] with columns of Extras_integration
+                for k in range(len(self.extra_cov_config)):
+                    beta_val = betas[5 + k]
+                    col_vals = Extras_integration[:, k]
+                    extra_part += beta_val * col_vals
+
+            predictions_log = const_part + cov_part + extra_part
             predictions = np.exp(predictions_log)
             t1_val = np.mean(predictions)
             results.append(t1_val)

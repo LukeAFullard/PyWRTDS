@@ -315,5 +315,52 @@ class TestWRTDS(unittest.TestCase):
         w_end = np.mean(width[-10:])
         self.assertLess(w_start, w_end)
 
+    def test_wrtds_plus(self):
+        """Test WRTDSplus with an extra covariate"""
+        np.random.seed(42)
+        n = 500
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+
+        # Primary Covariate (Discharge)
+        c0 = np.exp(np.sin(np.linspace(0, 10, n)))
+
+        # Secondary Covariate (e.g., Temperature - linear)
+        # Strong signal
+        temp = np.linspace(0, 30, n) + np.random.normal(0, 2, n)
+
+        # Response driven by BOTH
+        # ln(Sales) = 1*ln(c0) + 0.1*Temp
+        t0 = c0 * np.exp(0.1 * temp)
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0, 'Temp': temp})
+
+        # 1. Standard WRTDS (ignores Temp)
+        # Should perform poorly because Temp explains a lot of variance
+        dec_std = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+        res_std = dec_std.decant_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5})
+
+        # 2. WRTDSplus (includes Temp)
+        # Should account for Temp in the model
+        dec_plus = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend',
+                            extra_covariates=[{'col': 'Temp', 'log': False}])
+
+        # Need window for Temp. Passed via h_params as 'h_Temp'
+        res_plus = dec_plus.decant_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5, 'h_Temp': 10})
+
+        # Compare Residuals (estimated, not decanted)
+        # We need to expose prediction to do this clean comparison,
+        # but decant_series returns the NORMALIZED series.
+        # However, if WRTDSplus works, the normalized series should be smoother?
+        # Actually, if we normalize out Temp, we remove the Temp trend.
+        # In Standard, Temp trend remains in the residuals (or gets aliased into Time trend).
+
+        # Let's check if WRTDSplus runs without crashing and produces different results.
+        self.assertEqual(len(res_plus), n)
+        self.assertNotEqual(res_plus[0], res_std[0])
+
+        # Verify that grid is disabled for WRTDSplus
+        # Capturing stdout is hard in unit test, but we can check the behavior implicitly
+        # (It should take longer if N is large, but 500 is fast)
+
 if __name__ == '__main__':
     unittest.main()
