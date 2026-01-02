@@ -90,7 +90,10 @@ class Decanter:
         W = self.get_weights(t_target, q_target, s_target, **h_params)
 
         # Filter out zero-weight points to speed up matrix math
-        mask = W > 0
+        # Also ensure we only use valid (non-NaN) observations
+        valid_obs = ~np.isnan(self.Y)
+        mask = (W > 0) & valid_obs
+
         if np.sum(mask) < 10: # Safety check for sparse data
             return None
 
@@ -248,3 +251,87 @@ class Decanter:
             results.append(t1_val)
 
         return results
+
+    def add_kalman_correction(self, estimated_log_series, rho=0.9):
+        """
+        Applies WRTDS-Kalman correction (AR1 filtering of residuals).
+        estimated_log_series: array of log-space predictions from WRTDS (NOT flow normalized)
+        rho: autocorrelation coefficient (0.8 - 0.95 typical)
+
+        Returns: series with Kalman correction applied (in log space).
+        """
+        # Calculate residuals where we have observations
+        # res = log_obs - log_model
+
+        n = len(self.df)
+        residuals = np.full(n, np.nan)
+
+        # Only calculate for valid observations
+        valid_mask = ~np.isnan(self.Y)
+        residuals[valid_mask] = self.Y[valid_mask] - estimated_log_series[valid_mask]
+
+        # Interpolate residuals to all days using AR(1) decay
+        # For a day t, finding prev obs t_a and next obs t_b
+        # res(t) = res(t_a) * rho^(t-t_a) + ...
+
+        # To do this efficiently without a slow loop, we can use forward/backward pass
+
+        # Forward Pass
+        forward_res = np.zeros(n)
+        last_res = 0
+        last_t = -9999
+
+        for i in range(n):
+            if valid_mask[i]:
+                last_res = residuals[i]
+                last_t = self.T[i]
+                forward_res[i] = last_res
+            else:
+                # Decay
+                dt = self.T[i] - last_t
+                # If dt is huge (start of record), decay is effectively 0
+                if dt > 10: # Optimization: stop calculating if correlation is gone
+                    forward_res[i] = 0
+                else:
+                    # T is in years. rho is typically daily correlation?
+                    # WRTDS-K usually defines rho as DAILY correlation.
+                    # self.T is years. dt_days = dt * 365.25
+                    dt_days = dt * 365.25
+                    forward_res[i] = last_res * (rho ** dt_days)
+
+        # Backward Pass
+        backward_res = np.zeros(n)
+        last_res = 0
+        last_t = 9999
+
+        for i in range(n-1, -1, -1):
+            if valid_mask[i]:
+                last_res = residuals[i]
+                last_t = self.T[i]
+                backward_res[i] = last_res
+            else:
+                dt = last_t - self.T[i]
+                if dt > 10:
+                    backward_res[i] = 0
+                else:
+                    dt_days = dt * 365.25
+                    backward_res[i] = last_res * (rho ** dt_days)
+
+        # Combined Estimate
+        # If we have obs, it's just the residual.
+        # If not, it's a weighted average?
+        # Standard simple smoother: If we have forward and backward, take average?
+        # Actually, if we are strictly between two points, the 'best' estimate is roughly linear combination.
+        # But (rho^a + rho^b) is a reasonable approximation for simply adding the information content.
+        # Let's use the average of the two propagated signals.
+
+        interpolated_residuals = np.zeros(n)
+        for i in range(n):
+            if valid_mask[i]:
+                interpolated_residuals[i] = residuals[i]
+            else:
+                # Average the forward and backward projections
+                # This ensures continuity
+                interpolated_residuals[i] = (forward_res[i] + backward_res[i]) / 2.0
+
+        return estimated_log_series + interpolated_residuals

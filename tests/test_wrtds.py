@@ -114,5 +114,75 @@ class TestWRTDS(unittest.TestCase):
 
         self.assertGreater(slope_gfn, slope_stat)
 
+    def test_sparse_data_and_kalman(self):
+        """Test handling of sparse data and WRTDS-Kalman correction"""
+        np.random.seed(42)
+        n = 100
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+
+        # Simple signal: sine wave
+        t0 = np.sin(np.linspace(0, 10, n)) + 2.0 # Ensure > 0
+        c0 = np.ones(n) # Constant covariate for simplicity
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+
+        # Create sparse version
+        df_sparse = df.copy()
+        # Set 50% to NaN
+        mask = np.random.choice([True, False], size=n)
+        df_sparse.loc[mask, 'Sales'] = np.nan
+
+        dec = Decanter(df_sparse, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # 1. Run standard Decant (should ignore NaNs)
+        res = dec.decant_series(h_params={'h_time': 1, 'h_cov': 2, 'h_season': 0.5})
+        self.assertFalse(np.isnan(res).all())
+
+        # 2. Test Kalman
+        # To test Kalman, we need the ESTIMATED series (not decanted/normalized),
+        # because Kalman applies to the model fit.
+        # Let's manually generate "estimated" series (simple model)
+        # For this test, we assume the model found a flat line (mean),
+        # so residuals = observed - mean.
+
+        # In this synthetic case, Sales moves (sine), but covariate is flat.
+        # WRTDS should fit the sine wave via Time/Season terms.
+        # Let's say WRTDS underfits slightly.
+
+        # Let's try to run `add_kalman_correction` on a dummy estimate
+        est_log = np.log(df['Sales'].values) * 0.9 # Assume 10% error
+
+        # Applying Kalman should bring the estimate CLOSER to the observed values
+        # where we have data, and interpolate in between.
+
+        corrected_log = dec.add_kalman_correction(est_log, rho=0.9)
+        corrected = np.exp(corrected_log)
+
+        # Check error on OBSERVED points (should be 0 or very close if we used the residuals)
+        # Since we passed `est_log` and `dec.Y` is the observed log,
+        # Kalman logic: residual = Y - est.
+        # corrected = est + residual = est + (Y - est) = Y.
+        # So on observed days, we should recover the observed value exactly.
+
+        valid_mask = ~np.isnan(dec.Y)
+
+        # Error before correction
+        err_pre = np.mean(np.abs(np.exp(dec.Y[valid_mask]) - np.exp(est_log[valid_mask])))
+
+        # Error after correction (Should be 0)
+        err_post = np.mean(np.abs(np.exp(dec.Y[valid_mask]) - corrected[valid_mask]))
+
+        self.assertLess(err_post, 1e-10) # Should be effectively 0
+        self.assertLess(err_post, err_pre)
+
+        # Check interpolation (on a NaN point)
+        # Find a point that is NaN in input
+        nan_indices = np.where(~valid_mask)[0]
+        if len(nan_indices) > 0:
+            idx = nan_indices[0]
+            # The corrected value should NOT be equal to the initial estimate
+            # It should have been pulled by neighbors
+            self.assertNotEqual(corrected[idx], np.exp(est_log[idx]))
+
 if __name__ == '__main__':
     unittest.main()
