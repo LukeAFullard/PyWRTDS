@@ -11,6 +11,10 @@ class Decanter:
         response_col: string name of t0 (target)
         covariate_col: string name of c0 (driver)
         """
+        self.orig_date_col = date_col
+        self.orig_response_col = response_col
+        self.orig_covariate_col = covariate_col
+
         self.df = data.copy()
 
         # Convert dates to Decimal Time (e.g., 2023.5)
@@ -149,6 +153,14 @@ class Decanter:
         t_min, t_max = self.T.min(), self.T.max()
         q_min, q_max = self.Q.min(), self.Q.max()
 
+        # Handle constant covariate/time edge cases (linspace needs range)
+        if t_min == t_max:
+            t_min -= 0.01
+            t_max += 0.01
+        if q_min == q_max:
+            q_min -= 0.01
+            q_max += 0.01
+
         # Add small buffer to grid
         t_grid = np.linspace(t_min, t_max, n_t)
         q_grid = np.linspace(q_min, q_max, n_q)
@@ -251,6 +263,132 @@ class Decanter:
             results.append(t1_val)
 
         return results
+
+    def bootstrap_uncertainty(self, h_params, n_bootstraps=100, block_size=30, use_grid=True, method='block'):
+        """
+        Estimates uncertainty bands using Bootstrap on residuals.
+
+        method: 'block' (Standard Moving Block Bootstrap) or 'wild' (Wild Bootstrap for heteroscedasticity).
+
+        Returns: DataFrame with columns ['mean', 'p05', 'p95'] for the decanted series.
+        """
+        print(f"Starting Bootstrap Uncertainty Analysis ({method} method, {n_bootstraps} runs)...")
+
+        # 1. Calculate Initial Residuals (from Grid model)
+        # We need the estimated values (NOT flow normalized) to get residuals
+        # Ideally we reuse a grid if computed
+        if use_grid:
+            t_grid, q_grid, betas_grid = self.compute_grid(h_params)
+            # Create Interpolators
+            interpolators = []
+            for k in range(5):
+                grid_slice = pd.DataFrame(betas_grid[:, :, k])
+                grid_slice = grid_slice.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1)
+                interp = RegularGridInterpolator((t_grid, q_grid), grid_slice.values, bounds_error=False, fill_value=None)
+                interpolators.append(interp)
+
+            # Predict for every point to get residuals
+            preds_log = []
+            for i, row in self.df.iterrows():
+                pts = np.array([[row['decimal_time'], row['log_covariate']]])
+                betas = np.array([interp(pts)[0] for interp in interpolators])
+                if np.isnan(betas).any():
+                     preds_log.append(np.nan)
+                else:
+                    val = (betas[0] +
+                           betas[1] * row['log_covariate'] +
+                           betas[2] * row['decimal_time'] +
+                           betas[3] * np.sin(2*np.pi*row['decimal_time']) +
+                           betas[4] * np.cos(2*np.pi*row['decimal_time']))
+                    preds_log.append(val)
+            preds_log = np.array(preds_log)
+        else:
+            # Non-grid path not implemented for bootstrap to save complexity
+            raise NotImplementedError("Bootstrap requires use_grid=True for performance.")
+
+        residuals = self.Y - preds_log
+
+        # 2. Bootstrap Loop
+        n = len(residuals)
+
+        # Identify valid residuals (for Block method source)
+        valid_res_indices = np.where(~np.isnan(residuals))[0]
+        valid_res = residuals[valid_res_indices]
+
+        results_matrix = np.zeros((n_bootstraps, n))
+
+        for b in range(n_bootstraps):
+            boot_res = np.zeros(n)
+
+            if method == 'wild':
+                # Wild Bootstrap: Preserve local residual, multiply by random variable
+                # Rademacher: +1 or -1 with p=0.5
+                # Allows handling heteroscedasticity
+                flips = np.random.choice([-1, 1], size=n)
+                # Keep NaNs as NaNs (multiplication by +/-1 preserves NaN)
+                boot_res = residuals * flips
+
+            elif method == 'block':
+                # Block Bootstrap: Resample blocks from valid residuals
+                # Note: This destroys correspondence with Time if gaps exist,
+                # effectively assuming homoscedasticity.
+                current_idx = 0
+                while current_idx < n:
+                    # Pick random start from VALID residuals
+                    start = np.random.randint(0, len(valid_res) - block_size)
+                    chunk = valid_res[start : start + block_size]
+
+                    # Fill the bootstrap vector
+                    # Note: We are filling sequentially. If the original series had gaps,
+                    # this "compacts" the residuals. But we map them to the full time series 1-to-1?
+                    # No, usually we map index i -> index i.
+                    # Ideally, we should resample blocks of INDICES from the original series,
+                    # keeping the (NaN) structure if a block contains NaNs.
+                    # But standard practice often just resamples the errors.
+
+                    end_idx = min(current_idx + block_size, n)
+                    needed = end_idx - current_idx
+                    boot_res[current_idx : end_idx] = chunk[:needed]
+                    current_idx += block_size
+            else:
+                 raise ValueError(f"Unknown bootstrap method: {method}")
+
+            # Create synthetic response
+            # New Y = Pred + Resampled Residual
+            new_log_response = preds_log + boot_res
+
+            # Enforce Missingness Pattern:
+            # If original Y was NaN, synthetic Y must be NaN.
+            # This prevents "filling in" gaps which would artificially lower uncertainty.
+            new_log_response[np.isnan(self.Y)] = np.nan
+
+            # Create temporary Decanter for this run
+            # We assume Covariate and Time are fixed (Fixed-X resampling)
+            df_boot = self.df.copy()
+
+            # Update the ORIGINAL response column with the new synthetic data (inverse log)
+            # This ensures that when we re-init Decanter, it logs it back correctly to 'log_response'
+            # and performs the positive check.
+            # Handle NaNs: exp(NaN) = NaN.
+            df_boot[self.orig_response_col] = np.exp(new_log_response)
+
+            # Re-initialize using original column names
+            dec_boot = Decanter(df_boot, self.orig_date_col, self.orig_response_col, self.orig_covariate_col)
+
+            # Run Decant
+            # We pass the PRE-COMPUTED grid config to save time?
+            # No, we must re-compute grid because Y changed.
+            res = dec_boot.decant_series(h_params, use_grid=True)
+            results_matrix[b, :] = res
+
+        # 3. Aggregate
+        df_results = pd.DataFrame({
+            'mean': np.nanmean(results_matrix, axis=0),
+            'p05': np.nanpercentile(results_matrix, 5, axis=0),
+            'p95': np.nanpercentile(results_matrix, 95, axis=0)
+        })
+
+        return df_results
 
     def add_kalman_correction(self, estimated_log_series, rho=0.9):
         """

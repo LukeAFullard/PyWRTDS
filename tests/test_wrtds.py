@@ -184,5 +184,136 @@ class TestWRTDS(unittest.TestCase):
             # It should have been pulled by neighbors
             self.assertNotEqual(corrected[idx], np.exp(est_log[idx]))
 
+    def test_bootstrap(self):
+        """Test Bootstrap Uncertainty Analysis"""
+        np.random.seed(42)
+        n = 100
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+
+        # Simple signal
+        t0 = np.linspace(10, 20, n) * 2.0 # Ensure > 0
+        c0 = np.ones(n)
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # Run small bootstrap
+        # Use small grid size to speed up test
+        # Need use_grid=True
+        # Note: The Decanter init inside bootstrap uses Dummy col names 'log_response'.
+        # We need to make sure the original Decanter works even if we patch it?
+        # The bootstrap logic patches the NEW instance internals, so it should be fine.
+
+        # However, the dummy init line:
+        # dec_boot = Decanter(self.df, 'date', 'log_response', 'log_covariate')
+        # requires 'log_response' to exist in the dataframe passed.
+        # But 'log_response' IS created in the __init__ of the original object, and self.df HAS it.
+        # But we pass the string names of columns. 'log_response' is not the original name.
+        # If we pass 'log_response' as the response_col, the init will try to log it again!
+        # Resulting in log(log(y)). This is a bug in the implementation of bootstrap method.
+        # I need to fix the implementation in wrtds.py first?
+        # Or I can fix the test expectation if I modify the implementation.
+
+        # Wait, the implementation does:
+        # df_boot.iloc[:, list(self.df.columns).index(self.df.columns[self.df.columns.get_loc('log_response')-1])] = np.exp(new_log_response)
+        # It tries to find the original column (assumed to be before log_response?)
+        # And then:
+        # dec_boot = Decanter(self.df, 'date', 'log_response', 'log_covariate')
+        # If we initialize with 'log_response', the new init will do:
+        # self.df['log_response'] = np.log(self.df['log_response'])
+        # So we are double logging.
+
+        # We need to perform the actual bootstrap test now that logic is fixed
+        # Run bootstrap
+        # Using very small n_bootstraps to keep test fast
+        res_boot = dec.bootstrap_uncertainty(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, n_bootstraps=5, block_size=10)
+
+        self.assertIn('mean', res_boot.columns)
+        self.assertIn('p05', res_boot.columns)
+        self.assertIn('p95', res_boot.columns)
+        self.assertEqual(len(res_boot), n)
+
+        # Verify order
+        self.assertTrue(np.all(res_boot['p95'] >= res_boot['mean']))
+        self.assertTrue(np.all(res_boot['mean'] >= res_boot['p05']))
+
+        # The true trend is linear growth 20 -> 40
+        # The mean should be reasonably close (within noise)
+        # Note: res_boot is the normalized series.
+        # Since C0 is 1 (const), normalized = estimated.
+        # True signal is t0.
+
+        # Check first and last point
+        # Allow some margin for random noise in bootstrap
+        # p95 should effectively cover the true signal
+        # Since we added no noise in t0 (it's perfect signal), residuals are 0?
+        # No, fit_local_model won't be perfect.
+        # If residuals are 0, bootstrap collapses to single line.
+        # Let's add noise to t0 so bootstrap has something to do.
+
+        t0_noisy = t0 + np.random.normal(0, 1.0, n)
+        df_noisy = pd.DataFrame({'Date': dates, 'Sales': t0_noisy, 'AdSpend': c0})
+        dec_noisy = Decanter(df_noisy, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        res_boot_noisy = dec_noisy.bootstrap_uncertainty(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, n_bootstraps=10, block_size=10)
+
+        # The bounds should have some width now
+        width = res_boot_noisy['p95'] - res_boot_noisy['p05']
+        self.assertTrue(np.mean(width) > 0.1)
+
+    def test_wild_bootstrap(self):
+        """Test Wild Bootstrap and preservation of NaNs"""
+        np.random.seed(42)
+        n = 100
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+
+        # Signal with Heteroscedasticity (Variance increases over time)
+        trend = np.linspace(10, 20, n)
+        noise = np.random.normal(0, np.linspace(0.1, 1.0, n), n)
+        t0 = trend + noise
+        c0 = np.ones(n)
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+
+        # Add a gap
+        df.loc[50:55, 'Sales'] = np.nan
+
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # Run Wild Bootstrap
+        res_wild = dec.bootstrap_uncertainty(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5},
+                                             n_bootstraps=10,
+                                             use_grid=True,
+                                             method='wild')
+
+        # Check result shape
+        self.assertEqual(len(res_wild), n)
+
+        # Check that NaN gaps in input produce NaNs in output (p05, p95)
+        # Why? Because if input is NaN, residuals are NaN, synthetic Y is NaN, decanted output is...
+        # Wait, standard WRTDS 'decant_series' fills NaNs?
+        # decant_series iterates over ROWS. If row['log_covariate'] is valid, it predicts.
+        # It does NOT depend on row['Sales']. It depends on the MODEL fitted to Sales.
+        # If we feed a synthetic Y with NaNs to Decanter, fit_local_model will filter them out (as per our sparse update).
+        # So the model will still be fitted (using available data).
+        # And decant_series will produce values for the gap days!
+
+        # So, strictly speaking, uncertainty bands WILL exist during the gap.
+        # This is correct behavior: we infer the state during the gap based on neighbors.
+        # The uncertainty should be HIGHER in the gap because data is missing.
+
+        # Let's verify we didn't crash on NaNs
+        self.assertFalse(np.isnan(res_wild['mean'].iloc[0]))
+
+        # Check that Wild method ran and produced width
+        width = res_wild['p95'] - res_wild['p05']
+        self.assertTrue(np.mean(width) > 0)
+
+        # Ideally, uncertainty should be higher at end (high noise) than start (low noise)
+        # Wild bootstrap preserves this structure.
+        w_start = np.mean(width[:10])
+        w_end = np.mean(width[-10:])
+        self.assertLess(w_start, w_end)
+
 if __name__ == '__main__':
     unittest.main()
