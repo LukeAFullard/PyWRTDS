@@ -167,10 +167,13 @@ class Decanter:
 
         return t_grid, q_grid, betas_grid
 
-    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
+    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None):
         """
         Generates the cleaned time series t1 (Flow Normalized).
         If use_grid=True, it computes a regression surface and interpolates betas.
+
+        gfn_window: float (years). If provided, performs Generalized Flow Normalization (GFN)
+                    by integrating over covariate values only within [t - gfn_window/2, t + gfn_window/2].
         """
         results = []
 
@@ -224,7 +227,21 @@ class Decanter:
                           betas[3] * np.sin(2*np.pi*t_current) +
                           betas[4] * np.cos(2*np.pi*t_current))
 
-            cov_part = betas[1] * self.Q
+            # Select historical covariates for integration
+            if gfn_window is not None:
+                # Generalized Flow Normalization (Windowed)
+                h_window = gfn_window / 2
+                mask = np.abs(self.T - t_current) <= h_window
+                Q_integration = self.Q[mask]
+
+                # If window is empty (shouldn't happen with reasonable data), fallback to full
+                if len(Q_integration) == 0:
+                     Q_integration = self.Q
+            else:
+                # Stationary Flow Normalization (Full Record)
+                Q_integration = self.Q
+
+            cov_part = betas[1] * Q_integration
             predictions_log = const_part + cov_part
             predictions = np.exp(predictions_log)
             t1_val = np.mean(predictions)
