@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from scipy.interpolate import RegularGridInterpolator
 
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col):
@@ -134,59 +135,98 @@ class Decanter:
 
         return np.exp(prediction_log) # Return to linear space
 
-    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}):
+    def compute_grid(self, h_params, n_t=100, n_q=15):
+        """
+        Computes the regression surfaces (betas) on a regular grid.
+        Returns a tuple of (t_grid, q_grid, betas_grid)
+        """
+        print(f"Computing Grid ({n_t} x {n_q})...")
+
+        # Define grid boundaries
+        t_min, t_max = self.T.min(), self.T.max()
+        q_min, q_max = self.Q.min(), self.Q.max()
+
+        # Add small buffer to grid
+        t_grid = np.linspace(t_min, t_max, n_t)
+        q_grid = np.linspace(q_min, q_max, n_q)
+
+        # Shape: (n_t, n_q, 5 coefficients)
+        betas_grid = np.zeros((n_t, n_q, 5))
+
+        for i, t_val in enumerate(t_grid):
+            for j, q_val in enumerate(q_grid):
+                s_val = t_val % 1
+                betas = self.fit_local_model(t_val, q_val, s_val, h_params)
+                if betas is not None:
+                    betas_grid[i, j, :] = betas
+                else:
+                    # Fill with NaNs or nearest?
+                    # For now, NaNs, which might propagate.
+                    # Ideally, we should interpolate gaps, but WRTDS usually assumes dense enough data.
+                    betas_grid[i, j, :] = np.nan
+
+        return t_grid, q_grid, betas_grid
+
+    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
         """
         Generates the cleaned time series t1 (Flow Normalized).
+        If use_grid=True, it computes a regression surface and interpolates betas.
         """
         results = []
 
-        # Iterate through every time step in the original data
-        # Note: In production (Section 6), you would do this on a Grid
-        # and interpolate to save time. This loop is O(N^2).
-        print("Starting Decanting Process (this may take time)...")
+        interpolator = None
+        if use_grid:
+            t_grid, q_grid, betas_grid = self.compute_grid(h_params, **grid_config)
+
+            # Create an interpolator for each of the 5 beta coefficients
+            # RegularGridInterpolator requires points to be strictly ascending (linspace ensures this)
+            # We create a list of 5 interpolators
+            interpolators = []
+            for k in range(5):
+                # Handle NaNs in grid?
+                # RegularGridInterpolator doesn't like NaNs.
+                # Simple fill: Forward fill / Backward fill along Time axis
+                # This is a naive patch for sparse grids
+                grid_slice = pd.DataFrame(betas_grid[:, :, k])
+                grid_slice = grid_slice.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1)
+
+                interp = RegularGridInterpolator((t_grid, q_grid), grid_slice.values, bounds_error=False, fill_value=None)
+                interpolators.append(interp)
+
+        print(f"Starting Decanting Process (Method: {'Grid' if use_grid else 'Exact'})...")
 
         for i, row in self.df.iterrows():
             t_current = row['decimal_time']
             s_current = row['season']
-
-            # 1. Fit the model specific to this day's conditions
-            # We use the current time/season, but we center the covariate window
-            # generally or use the actual covariate to find the local relationship.
-            # Usually, we center the model estimation on the actual observed Q
-            # to get the most accurate betas for this domain.
             q_current = row['log_covariate']
 
-            betas = self.fit_local_model(t_current, q_current, s_current, h_params)
+            betas = None
+
+            if use_grid:
+                # Interpolate betas
+                # Input to interpolator is (t, q)
+                pts = np.array([[t_current, q_current]])
+                betas = np.array([interp(pts)[0] for interp in interpolators])
+                if np.isnan(betas).any():
+                    betas = None
+            else:
+                # Exact calculation
+                betas = self.fit_local_model(t_current, q_current, s_current, h_params)
 
             if betas is None:
                 results.append(np.nan)
                 continue
 
-            # 2. Flow Normalization (Integration)
-            # Instead of predicting with q_current, we predict with ALL historical Qs
-            # This effectively integrates out the covariate effect.
-
-            # Method: Monte Carlo Integration over historical distribution
-            # We use the vector of all historical log_covariates: self.Q
-
-            # Construct prediction matrix for integration
-            # We need to predict for t_current, but varying Q
+            # Flow Normalization (Integration)
             # Formula: beta0 + beta1*Q_hist + beta2*t + ...
-
-            # Constant parts of the prediction equation
             const_part = (betas[0] +
                           betas[2] * t_current +
                           betas[3] * np.sin(2*np.pi*t_current) +
                           betas[4] * np.cos(2*np.pi*t_current))
 
-            # Variable part (the covariate)
             cov_part = betas[1] * self.Q
-
-            # Predictions for this specific day, under all historical covariate conditions
             predictions_log = const_part + cov_part
             predictions = np.exp(predictions_log)
-
-            # The "Decanted" value is the mean of these expectations
             t1_val = np.mean(predictions)
             results.append(t1_val)
 
