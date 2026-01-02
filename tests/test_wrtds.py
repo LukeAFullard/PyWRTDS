@@ -362,5 +362,43 @@ class TestWRTDS(unittest.TestCase):
         # Capturing stdout is hard in unit test, but we can check the behavior implicitly
         # (It should take longer if N is large, but 500 is fast)
 
+    def test_wrtds_projection(self):
+        """Test WRTDS-P (Projection with custom scenarios)"""
+        np.random.seed(42)
+        n = 500
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+
+        # Base: Sales = 10 * AdSpend
+        # Need variance in AdSpend to identify the slope!
+        c0 = np.random.uniform(5, 15, n)
+        t0 = c0 * 10
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # 1. Standard Decant
+        # With stationary flow normalization, it should roughly recover the mean relationship
+        # Mean C0 ~ 10. Mean T0 ~ 100.
+        res_std = dec.decant_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5})
+        # The result should be close to 10 * E[C0] if linear?
+        # In log space: E[ln(T0)] = ln(10) + E[ln(C0)].
+        # Exp(E[ln]) is geometric mean.
+        # But decanting integrates in linear space (mean of exp predictions).
+        # So it should be close to 100.
+
+        # 2. Projection: What if AdSpend was FIXED at 20?
+        # Result should be 20 * 10 = 200
+        scenario_df = pd.DataFrame({'AdSpend': np.ones(n) * 20})
+        res_proj = dec.decant_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5},
+                                     integration_scenarios=scenario_df)
+
+        # Allow some tolerance for regression noise
+        # 200 is the target.
+        self.assertGreater(np.mean(res_proj), 180)
+        self.assertLess(np.mean(res_proj), 220)
+
+        # It should be significantly higher than the standard result (around 100)
+        self.assertGreater(np.mean(res_proj), np.mean(res_std) * 1.5)
+
 if __name__ == '__main__':
     unittest.main()

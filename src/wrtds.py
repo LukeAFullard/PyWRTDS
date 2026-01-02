@@ -235,15 +235,46 @@ class Decanter:
 
         return t_grid, q_grid, betas_grid
 
-    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None):
+    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None, integration_scenarios=None):
         """
         Generates the cleaned time series t1 (Flow Normalized).
         If use_grid=True, it computes a regression surface and interpolates betas.
 
         gfn_window: float (years). If provided, performs Generalized Flow Normalization (GFN)
                     by integrating over covariate values only within [t - gfn_window/2, t + gfn_window/2].
+
+        integration_scenarios: pandas DataFrame (optional). WRTDS-P (Projection).
+                    If provided, these values are used for the integration step instead of the historical
+                    covariate record. Must contain columns matching the original covariate names.
         """
         results = []
+
+        # Pre-process integration scenarios if provided
+        Q_scenario = None
+        Extras_scenario = None
+
+        if integration_scenarios is not None:
+            # Transform scenario to Log Space
+            # Primary Covariate
+            q_raw = integration_scenarios[self.orig_covariate_col]
+            if (q_raw <= 0).any():
+                 raise ValueError("Integration scenario primary covariate must be strictly positive.")
+            Q_scenario = np.log(q_raw).values
+
+            # Extra Covariates
+            if self.extra_cov_config:
+                Extras_scenario_list = []
+                for conf in self.extra_cov_config:
+                    col = conf['col']
+                    is_log = conf.get('log', False)
+                    vals = integration_scenarios[col]
+                    if is_log:
+                        if (vals <= 0).any():
+                            raise ValueError(f"Integration scenario extra covariate '{col}' contains non-positive values.")
+                        Extras_scenario_list.append(np.log(vals).values)
+                    else:
+                        Extras_scenario_list.append(vals.values)
+                Extras_scenario = np.column_stack(Extras_scenario_list)
 
         # Grid not supported for WRTDSplus yet
         if use_grid and self.X_extras is not None:
@@ -305,10 +336,17 @@ class Decanter:
                           betas[3] * np.sin(2*np.pi*t_current) +
                           betas[4] * np.cos(2*np.pi*t_current))
 
-            # Select historical covariates for integration
-            # We need both Q and X_extras for the same historical points
+            # Select covariates for integration
+            # Priority:
+            # 1. Custom Scenario (WRTDS-P) -> Uses provided distribution (Stationary over the scenario)
+            # 2. GFN (Windowed History)
+            # 3. SFN (Full History)
 
-            if gfn_window is not None:
+            if integration_scenarios is not None:
+                # WRTDS-P
+                Q_integration = Q_scenario
+                Extras_integration = Extras_scenario
+            elif gfn_window is not None:
                 # Generalized Flow Normalization (Windowed)
                 h_window = gfn_window / 2
                 mask = np.abs(self.T - t_current) <= h_window
@@ -334,6 +372,7 @@ class Decanter:
             if self.X_extras is not None:
                 # betas[5:] are for extras
                 # We need to dot product betas[5:] with columns of Extras_integration
+                # Note: If we have custom scenarios, Extras_integration is set correctly above
                 for k in range(len(self.extra_cov_config)):
                     beta_val = betas[5 + k]
                     col_vals = Extras_integration[:, k]
