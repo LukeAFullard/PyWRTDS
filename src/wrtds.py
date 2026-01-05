@@ -424,8 +424,29 @@ class Decanter:
                     preds_log.append(val)
             preds_log = np.array(preds_log)
         else:
-            # Non-grid path not implemented for bootstrap to save complexity
-            raise NotImplementedError("Bootstrap requires use_grid=True for performance.")
+            # Non-grid (Exact) calculation
+            # We must iterate over all points and fit local model to get predictions
+            preds_log = []
+            for i, row in self.df.iterrows():
+                t_current = row['decimal_time']
+                s_current = row['season']
+                q_current = row['log_covariate']
+
+                # Extract extras
+                extras_current = None
+                if self.X_extras is not None:
+                    extras_current = self.X_extras[i, :]
+
+                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
+
+                if betas is None:
+                    preds_log.append(np.nan)
+                else:
+                    val = self.predict_point(t_current, q_current, betas, extras_current)
+                    # predict_point returns exp (linear space), but we need log space for residuals
+                    preds_log.append(np.log(val))
+
+            preds_log = np.array(preds_log)
 
         residuals = self.Y - preds_log
 
@@ -494,12 +515,14 @@ class Decanter:
             df_boot[self.orig_response_col] = np.exp(new_log_response)
 
             # Re-initialize using original column names
-            dec_boot = Decanter(df_boot, self.orig_date_col, self.orig_response_col, self.orig_covariate_col)
+            # We must also pass the extra covariates config if it existed
+            dec_boot = Decanter(df_boot, self.orig_date_col, self.orig_response_col, self.orig_covariate_col, extra_covariates=self.extra_cov_config)
 
             # Run Decant
             # We pass the PRE-COMPUTED grid config to save time?
             # No, we must re-compute grid because Y changed.
-            res = dec_boot.decant_series(h_params, use_grid=True)
+            # If use_grid was False, we must continue using False
+            res = dec_boot.decant_series(h_params, use_grid=use_grid)
             results_matrix[b, :] = res
 
         # 3. Aggregate

@@ -200,30 +200,7 @@ class TestWRTDS(unittest.TestCase):
         # Run small bootstrap
         # Use small grid size to speed up test
         # Need use_grid=True
-        # Note: The Decanter init inside bootstrap uses Dummy col names 'log_response'.
-        # We need to make sure the original Decanter works even if we patch it?
-        # The bootstrap logic patches the NEW instance internals, so it should be fine.
-
-        # However, the dummy init line:
-        # dec_boot = Decanter(self.df, 'date', 'log_response', 'log_covariate')
-        # requires 'log_response' to exist in the dataframe passed.
-        # But 'log_response' IS created in the __init__ of the original object, and self.df HAS it.
-        # But we pass the string names of columns. 'log_response' is not the original name.
-        # If we pass 'log_response' as the response_col, the init will try to log it again!
-        # Resulting in log(log(y)). This is a bug in the implementation of bootstrap method.
-        # I need to fix the implementation in wrtds.py first?
-        # Or I can fix the test expectation if I modify the implementation.
-
-        # Wait, the implementation does:
-        # df_boot.iloc[:, list(self.df.columns).index(self.df.columns[self.df.columns.get_loc('log_response')-1])] = np.exp(new_log_response)
-        # It tries to find the original column (assumed to be before log_response?)
-        # And then:
-        # dec_boot = Decanter(self.df, 'date', 'log_response', 'log_covariate')
-        # If we initialize with 'log_response', the new init will do:
-        # self.df['log_response'] = np.log(self.df['log_response'])
-        # So we are double logging.
-
-        # We need to perform the actual bootstrap test now that logic is fixed
+        # We need to perform the actual bootstrap test
         # Run bootstrap
         # Using very small n_bootstraps to keep test fast
         res_boot = dec.bootstrap_uncertainty(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, n_bootstraps=5, block_size=10)
@@ -399,6 +376,41 @@ class TestWRTDS(unittest.TestCase):
 
         # It should be significantly higher than the standard result (around 100)
         self.assertGreater(np.mean(res_proj), np.mean(res_std) * 1.5)
+
+    def test_bootstrap_wrtds_plus(self):
+        """Test Bootstrap with WRTDSplus (Exact method / use_grid=False)"""
+        # Generate dummy data
+        np.random.seed(42)
+        n = 100
+        dates = pd.date_range(start='2020-01-01', periods=n, freq='D')
+
+        # Primary Covariate (Discharge)
+        c0 = np.random.uniform(10, 100, n)
+        # Extra Covariate (Temp)
+        temp = np.random.uniform(10, 30, n)
+
+        # Response
+        t0 = c0 * 2 + temp * 0.5
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0, 'Temp': temp})
+
+        # Initialize with Extra Covariates
+        dec = Decanter(df, 'Date', 'Sales', 'AdSpend', extra_covariates=[{'col': 'Temp', 'log': False}])
+
+        # This used to raise NotImplementedError or fail
+        try:
+            res = dec.bootstrap_uncertainty(h_params={'h_time': 1, 'h_cov': 2, 'h_season': 0.5, 'h_Temp': 5},
+                                      n_bootstraps=2,
+                                      use_grid=False)
+
+            self.assertIn('mean', res.columns)
+            self.assertIn('p05', res.columns)
+            self.assertIn('p95', res.columns)
+            self.assertEqual(len(res), n)
+            self.assertFalse(np.isnan(res['mean']).all())
+
+        except Exception as e:
+            self.fail(f"Bootstrap with WRTDSplus raised unexpected exception: {e}")
 
 if __name__ == '__main__':
     unittest.main()
