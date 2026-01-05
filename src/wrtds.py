@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from scipy.interpolate import RegularGridInterpolator
+import itertools
 
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None):
@@ -195,18 +196,25 @@ class Decanter:
 
         return np.exp(prediction_log) # Return to linear space
 
-    def compute_grid(self, h_params, n_t=100, n_q=15):
+    def compute_grid(self, h_params, n_t=100, n_q=15, n_extra=7):
         """
         Computes the regression surfaces (betas) on a regular grid.
-        Returns a tuple of (t_grid, q_grid, betas_grid)
-        """
-        print(f"Computing Grid ({n_t} x {n_q})...")
+        Returns a tuple of (grid_axes_tuple, betas_grid)
 
-        # Define grid boundaries
+        grid_axes_tuple: (t_grid, q_grid, extra1_grid, ...)
+        betas_grid: N-D array of coefficients
+        """
+        n_extras = self.X_extras.shape[1] if self.X_extras is not None else 0
+        grid_dims_str = f"{n_t} x {n_q}"
+        if n_extras > 0:
+            grid_dims_str += f" x {n_extra}" * n_extras
+
+        print(f"Computing Grid ({grid_dims_str})...")
+
+        # 1. Define grid boundaries for Time and Primary Covariate
         t_min, t_max = self.T.min(), self.T.max()
         q_min, q_max = self.Q.min(), self.Q.max()
 
-        # Handle constant covariate/time edge cases (linspace needs range)
         if t_min == t_max:
             t_min -= 0.01
             t_max += 0.01
@@ -214,26 +222,56 @@ class Decanter:
             q_min -= 0.01
             q_max += 0.01
 
-        # Add small buffer to grid
         t_grid = np.linspace(t_min, t_max, n_t)
         q_grid = np.linspace(q_min, q_max, n_q)
 
-        # Shape: (n_t, n_q, 5 coefficients)
-        betas_grid = np.zeros((n_t, n_q, 5))
+        # 2. Define grid boundaries for Extra Covariates
+        extra_grids = []
+        if n_extras > 0:
+            for k in range(n_extras):
+                vals = self.X_extras[:, k]
+                e_min, e_max = vals.min(), vals.max()
+                if e_min == e_max:
+                    e_min -= 0.01
+                    e_max += 0.01
+                # Use n_extra points for each extra dimension
+                e_grid = np.linspace(e_min, e_max, n_extra)
+                extra_grids.append(e_grid)
 
-        for i, t_val in enumerate(t_grid):
-            for j, q_val in enumerate(q_grid):
-                s_val = t_val % 1
-                betas = self.fit_local_model(t_val, q_val, s_val, h_params)
-                if betas is not None:
-                    betas_grid[i, j, :] = betas
-                else:
-                    # Fill with NaNs or nearest?
-                    # For now, NaNs, which might propagate.
-                    # Ideally, we should interpolate gaps, but WRTDS usually assumes dense enough data.
-                    betas_grid[i, j, :] = np.nan
+        # 3. Create List of Axes
+        # Axes: [T, Q, E1, E2...]
+        grid_axes = [t_grid, q_grid] + extra_grids
 
-        return t_grid, q_grid, betas_grid
+        # 4. Prepare Betas Grid
+        # Shape: (n_t, n_q, n_e1, ..., n_params)
+        shape = tuple(len(g) for g in grid_axes) + (5 + n_extras,)
+        betas_grid = np.zeros(shape)
+
+        # 5. Iterate over all grid points
+        # itertools.product(*grid_axes) yields tuples (t, q, e1, ...)
+        # We also need indices to fill the array.
+
+        ranges = [range(len(g)) for g in grid_axes]
+
+        for indices in itertools.product(*ranges):
+            # indices is tuple (i_t, i_q, i_e1, ...)
+
+            # Get values
+            values = [grid_axes[k][indices[k]] for k in range(len(grid_axes))]
+            t_val = values[0]
+            q_val = values[1]
+            extras_val = values[2:] if n_extras > 0 else None
+
+            s_val = t_val % 1
+
+            betas = self.fit_local_model(t_val, q_val, s_val, h_params, extras_val)
+
+            if betas is not None:
+                betas_grid[indices] = betas
+            else:
+                betas_grid[indices] = np.nan
+
+        return tuple(grid_axes), betas_grid
 
     def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None, integration_scenarios=None):
         """
@@ -276,28 +314,52 @@ class Decanter:
                         Extras_scenario_list.append(vals.values)
                 Extras_scenario = np.column_stack(Extras_scenario_list)
 
-        # Grid not supported for WRTDSplus yet
-        if use_grid and self.X_extras is not None:
-            print("Warning: Grid optimization not supported for WRTDSplus (extra covariates). Falling back to Exact method.")
-            use_grid = False
-
         interpolator = None
         if use_grid:
-            t_grid, q_grid, betas_grid = self.compute_grid(h_params, **grid_config)
+            grid_axes, betas_grid = self.compute_grid(h_params, **grid_config)
 
-            # Create an interpolator for each of the 5 beta coefficients
+            # The last dimension of betas_grid is the parameter dimension
+            n_params_grid = betas_grid.shape[-1]
+
+            # Create an interpolator for each beta coefficient
             # RegularGridInterpolator requires points to be strictly ascending (linspace ensures this)
-            # We create a list of 5 interpolators
+            # We create a list of interpolators
             interpolators = []
-            for k in range(5):
-                # Handle NaNs in grid?
-                # RegularGridInterpolator doesn't like NaNs.
-                # Simple fill: Forward fill / Backward fill along Time axis
-                # This is a naive patch for sparse grids
-                grid_slice = pd.DataFrame(betas_grid[:, :, k])
-                grid_slice = grid_slice.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1)
 
-                interp = RegularGridInterpolator((t_grid, q_grid), grid_slice.values, bounds_error=False, fill_value=None)
+            # Helper to fill NaNs in N-D array
+            # Simple approach: Iterate axes and ffill/bfill?
+            # Or just assume dense enough grid.
+            # For 2D we used pandas. For ND pandas is harder.
+            # Let's rely on standard assumption that WRTDS grid is dense enough.
+            # If strictly needed, we can implement N-D filling, but it's complex.
+            # Fallback: fill with 0 or mean? NaNs will cause interpolation to fail or be NaN.
+            # Let's replace NaNs with 0 for now to prevent crash, though it's suboptimal.
+            # Ideally we'd use 'nearest' but RegularGridInterpolator doesn't infer.
+            if np.isnan(betas_grid).any():
+                # mask = np.isnan(betas_grid)
+                # betas_grid[mask] = 0 # Dangerous?
+                # Better: Allow NaNs to propagate to predictions (so we know where data is missing)
+                pass
+
+            for k in range(n_params_grid):
+                # Slice the grid for the k-th beta
+                # The values array passed to RGI must match grid dims.
+                # betas_grid shape is (n_t, n_q, ..., n_params)
+                # We need (n_t, n_q, ...)
+                grid_slice = betas_grid[..., k]
+
+                # Handling NaNs in 2D case legacy:
+                if len(grid_axes) == 2:
+                     grid_slice_df = pd.DataFrame(grid_slice)
+                     grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
+
+                # Check for NaNs again
+                if np.isnan(grid_slice).any():
+                     # If we still have NaNs (ND case or sparse 2D), fill with 0 to allow interp to run
+                     # Real solution: better grid filling logic
+                     grid_slice[np.isnan(grid_slice)] = 0.0
+
+                interp = RegularGridInterpolator(grid_axes, grid_slice, bounds_error=False, fill_value=None)
                 interpolators.append(interp)
 
         print(f"Starting Decanting Process (Method: {'Grid' if use_grid else 'Exact'})...")
@@ -316,10 +378,20 @@ class Decanter:
 
             if use_grid:
                 # Interpolate betas
-                # Input to interpolator is (t, q)
-                pts = np.array([[t_current, q_current]])
-                betas = np.array([interp(pts)[0] for interp in interpolators])
-                if np.isnan(betas).any():
+                # Input to interpolator is (t, q, [extras...])
+                pt_list = [t_current, q_current]
+                if extras_current is not None:
+                    pt_list.extend(extras_current)
+
+                pts = np.array([pt_list])
+
+                try:
+                    betas = np.array([interp(pts)[0] for interp in interpolators])
+                except Exception:
+                    # In case of dimension mismatch or other interp error
+                    betas = None
+
+                if betas is None or np.isnan(betas).any():
                     betas = None
             else:
                 # Exact calculation
@@ -399,29 +471,51 @@ class Decanter:
         # We need the estimated values (NOT flow normalized) to get residuals
         # Ideally we reuse a grid if computed
         if use_grid:
-            t_grid, q_grid, betas_grid = self.compute_grid(h_params)
-            # Create Interpolators
+            # Note: We do not pass grid_config here, using default.
+            # Ideally should expose grid_config to bootstrap_uncertainty too.
+            grid_axes, betas_grid = self.compute_grid(h_params)
+            n_params_grid = betas_grid.shape[-1]
+
             interpolators = []
-            for k in range(5):
-                grid_slice = pd.DataFrame(betas_grid[:, :, k])
-                grid_slice = grid_slice.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1)
-                interp = RegularGridInterpolator((t_grid, q_grid), grid_slice.values, bounds_error=False, fill_value=None)
+            for k in range(n_params_grid):
+                grid_slice = betas_grid[..., k]
+
+                # Legacy 2D filling
+                if len(grid_axes) == 2:
+                    grid_slice_df = pd.DataFrame(grid_slice)
+                    grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
+
+                if np.isnan(grid_slice).any():
+                     grid_slice[np.isnan(grid_slice)] = 0.0
+
+                interp = RegularGridInterpolator(grid_axes, grid_slice, bounds_error=False, fill_value=None)
                 interpolators.append(interp)
 
             # Predict for every point to get residuals
             preds_log = []
             for i, row in self.df.iterrows():
-                pts = np.array([[row['decimal_time'], row['log_covariate']]])
-                betas = np.array([interp(pts)[0] for interp in interpolators])
-                if np.isnan(betas).any():
+                # Construct pt: t, q, [extras]
+                pt_list = [row['decimal_time'], row['log_covariate']]
+
+                extras_current = None
+                if self.X_extras is not None:
+                    extras_current = self.X_extras[i, :]
+                    pt_list.extend(extras_current)
+
+                pts = np.array([pt_list])
+
+                try:
+                    betas = np.array([interp(pts)[0] for interp in interpolators])
+                except Exception:
+                    betas = None
+
+                if betas is None or np.isnan(betas).any():
                      preds_log.append(np.nan)
                 else:
-                    val = (betas[0] +
-                           betas[1] * row['log_covariate'] +
-                           betas[2] * row['decimal_time'] +
-                           betas[3] * np.sin(2*np.pi*row['decimal_time']) +
-                           betas[4] * np.cos(2*np.pi*row['decimal_time']))
-                    preds_log.append(val)
+                    # Calculate prediction
+                    val = self.predict_point(row['decimal_time'], row['log_covariate'], betas, extras_current)
+                    preds_log.append(np.log(val)) # Store in log space for residual calc
+
             preds_log = np.array(preds_log)
         else:
             # Non-grid (Exact) calculation

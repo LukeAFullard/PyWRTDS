@@ -412,5 +412,56 @@ class TestWRTDS(unittest.TestCase):
         except Exception as e:
             self.fail(f"Bootstrap with WRTDSplus raised unexpected exception: {e}")
 
+    def test_wrtds_plus_grid(self):
+        """Test Grid Optimization for WRTDSplus (N-D Grid)"""
+        # Generate dummy data
+        np.random.seed(42)
+        n = 200
+        dates = pd.date_range(start='2020-01-01', periods=n, freq='D')
+
+        # Primary Covariate
+        c0 = np.random.uniform(10, 50, n)
+        # Extra Covariate (e.g. Temp)
+        temp = np.random.uniform(5, 25, n)
+
+        # Response depends on both
+        t0 = c0 * 2 + temp * 0.5
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0, 'Temp': temp})
+
+        dec = Decanter(df, 'Date', 'Sales', 'AdSpend', extra_covariates=[{'col': 'Temp', 'log': False}])
+
+        # 1. Run Exact Method
+        # Use small h_params to make it sensitive
+        h_params = {'h_time': 1, 'h_cov': 2, 'h_season': 0.5, 'h_Temp': 5}
+        res_exact = dec.decant_series(h_params, use_grid=False)
+
+        # 2. Run Grid Method
+        # Default grid config uses 15 points for Q. We'll use default for Temp too (7 points)
+        res_grid = dec.decant_series(h_params, use_grid=True)
+
+        # Check basic validity
+        self.assertFalse(np.isnan(res_grid).all())
+        self.assertEqual(len(res_grid), n)
+
+        # Compare Exact vs Grid
+        # They should be highly correlated and close in value
+        # Differences arise from interpolation error
+
+        # Filter NaNs (if any, though random data should be dense enough)
+        mask = ~np.isnan(res_exact) & ~np.isnan(res_grid)
+
+        diff = np.abs(np.array(res_exact)[mask] - np.array(res_grid)[mask])
+        mae = np.mean(diff)
+
+        # Relative error
+        mean_val = np.mean(np.array(res_exact)[mask])
+        rel_err = mae / mean_val
+
+        print(f"Grid vs Exact MAE: {mae:.4f}, Rel Err: {rel_err:.4f}")
+
+        # Expect reasonably close match (e.g. < 5% relative error)
+        self.assertLess(rel_err, 0.05)
+
 if __name__ == '__main__':
     unittest.main()
