@@ -552,68 +552,46 @@ class Decanter:
         valid_mask = ~np.isnan(self.Y)
         residuals[valid_mask] = self.Y[valid_mask] - estimated_log_series[valid_mask]
 
-        # Interpolate residuals to all days using AR(1) decay
-        # For a day t, finding prev obs t_a and next obs t_b
-        # res(t) = res(t_a) * rho^(t-t_a) + ...
-
-        # To do this efficiently without a slow loop, we can use forward/backward pass
+        # Interpolate residuals to all days using AR(1) decay via Vectorized operations
+        # Create DataFrame for easy ffill/bfill
+        df_kalman = pd.DataFrame({
+            'T': self.T,
+            'Res': residuals
+        })
 
         # Forward Pass
-        forward_res = np.zeros(n)
-        last_res = 0
-        last_t = -9999
+        # 1. Forward fill the valid residuals and their timestamps
+        df_kalman['Last_Res'] = df_kalman['Res'].ffill()
+        df_kalman['Last_T'] = df_kalman['T'].where(~df_kalman['Res'].isna()).ffill()
 
-        for i in range(n):
-            if valid_mask[i]:
-                last_res = residuals[i]
-                last_t = self.T[i]
-                forward_res[i] = last_res
-            else:
-                # Decay
-                dt = self.T[i] - last_t
-                # If dt is huge (start of record), decay is effectively 0
-                if dt > 10: # Optimization: stop calculating if correlation is gone
-                    forward_res[i] = 0
-                else:
-                    # T is in years. rho is typically daily correlation?
-                    # WRTDS-K usually defines rho as DAILY correlation.
-                    # self.T is years. dt_days = dt * 365.25
-                    dt_days = dt * 365.25
-                    forward_res[i] = last_res * (rho ** dt_days)
+        # 2. Calculate dt from last valid observation
+        # Fill NaNs in Last_T with a dummy distant past if starts with NaN
+        df_kalman['Last_T'] = df_kalman['Last_T'].fillna(-9999)
+        dt_forward = (df_kalman['T'] - df_kalman['Last_T']) * 365.25
+
+        # 3. Apply decay
+        # For valid points, dt is 0, so rho^0 = 1 -> returns Res
+        # We fill initial NaNs (before first obs) with 0
+        forward_res = (df_kalman['Last_Res'].fillna(0) * (rho ** dt_forward)).values
 
         # Backward Pass
-        backward_res = np.zeros(n)
-        last_res = 0
-        last_t = 9999
+        # 1. Backward fill
+        df_kalman['Next_Res'] = df_kalman['Res'].bfill()
+        df_kalman['Next_T'] = df_kalman['T'].where(~df_kalman['Res'].isna()).bfill()
 
-        for i in range(n-1, -1, -1):
-            if valid_mask[i]:
-                last_res = residuals[i]
-                last_t = self.T[i]
-                backward_res[i] = last_res
-            else:
-                dt = last_t - self.T[i]
-                if dt > 10:
-                    backward_res[i] = 0
-                else:
-                    dt_days = dt * 365.25
-                    backward_res[i] = last_res * (rho ** dt_days)
+        # 2. Calculate dt to next valid observation
+        df_kalman['Next_T'] = df_kalman['Next_T'].fillna(9999)
+        dt_backward = (df_kalman['Next_T'] - df_kalman['T']) * 365.25
+
+        # 3. Apply decay
+        backward_res = (df_kalman['Next_Res'].fillna(0) * (rho ** dt_backward)).values
 
         # Combined Estimate
-        # If we have obs, it's just the residual.
-        # If not, it's a weighted average?
-        # Standard simple smoother: If we have forward and backward, take average?
-        # Actually, if we are strictly between two points, the 'best' estimate is roughly linear combination.
-        # But (rho^a + rho^b) is a reasonable approximation for simply adding the information content.
-        # Let's use the average of the two propagated signals.
+        # Average the forward and backward projections
+        interpolated_residuals = (forward_res + backward_res) / 2.0
 
-        interpolated_residuals = np.zeros(n)
-        for i in range(n):
-            if valid_mask[i]:
-                interpolated_residuals[i] = residuals[i]
-            else:
-                # Average the forward and backward projections
-                # This ensures continuity
-                interpolated_residuals[i] = (forward_res[i] + backward_res[i]) / 2.0
+        # Enforce exact match on valid observations (though the formula rho^0=1 guarantees it)
+        # Just to be safe against floating point noise
+        interpolated_residuals[valid_mask] = residuals[valid_mask]
 
         return estimated_log_series + interpolated_residuals
