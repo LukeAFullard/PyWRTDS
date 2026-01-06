@@ -12,12 +12,18 @@ Originally developed for hydrology (river water quality), this framework is gene
 *   **Locally Weighted Regression:** Fits a unique model for every time step to capture non-stationary relationships.
 *   **Flow Normalization:** Integrates over the probability distribution of the covariate to remove its stochastic influence.
 *   **Grid Optimization:** Uses interpolation surfaces to scale to large datasets ($O(1)$ lookup per point).
-*   **Generalized Flow Normalization (GFN):** Handles covariates that have their own long-term trends.
-*   **WRTDS-Kalman:** Applies AR(1) filtering to residuals to restore system memory/autocorrelation.
+*   **Generalized Flow Normalization (GFN):** Handles covariates that have their own long-term trends using **locally weighted integration**.
+*   **WRTDS-Kalman:** Applies **forward-only** AR(1) filtering to residuals to restore system memory/autocorrelation (causal).
 *   **WRTDSplus:** Supports multiple covariates (e.g., Temperature, Lagged Flow) beyond the standard model.
 *   **WRTDS-P (Projection):** Enables "What-If" scenario analysis by integrating over simulated covariate distributions.
 *   **Uncertainty Analysis:** Provides confidence intervals via Block or Wild Bootstrap.
-*   **Note:** Handling of censored data (Tobit regression) is planned but not yet implemented.
+
+## Limitations and Known Issues
+
+*   **Censored Data (Tobit):** Contrary to the theoretical background, this implementation does **not** yet support Tobit regression for censored data (e.g., values below detection limits). Standard Weighted Least Squares (WLS) is used.
+*   **Extrapolation:** Predictions made for dates or covariate values outside the training grid range will trigger a `UserWarning`. Extrapolation results should be treated with caution.
+*   **Rank Deficiency:** Local models with insufficient data diversity (collinear covariates) will return `NaN` coefficients instead of unstable estimates.
+*   **Persistence:** The `load_model` method strictly validates that the loaded grid dimensions match the current covariate configuration to prevent data corruption.
 
 ## Installation
 
