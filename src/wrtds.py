@@ -4,6 +4,7 @@ from datetime import datetime
 from scipy.interpolate import RegularGridInterpolator
 import itertools
 import pickle
+import warnings
 
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None):
@@ -176,6 +177,10 @@ class Decanter:
 
         try:
             betas, residuals, rank, s = np.linalg.lstsq(X_w, y_w, rcond=None)
+            # Check for rank deficiency
+            # Note: rank is returned as scalar if singular, but it is scalar here.
+            if rank < n_params:
+                return None
             return betas
         except np.linalg.LinAlgError:
             return None
@@ -358,6 +363,15 @@ class Decanter:
         self.Q = state.get('history_Q')
         self.X_extras = state.get('history_X_extras')
 
+        # Validation: Check that extra_cov_config matches grid dimensions
+        n_extras_config = len(self.extra_cov_config)
+        n_extras_grid = len(self.grid_axes) - 2
+
+        if n_extras_config != n_extras_grid:
+            # Try to recover if config was not saved or different
+            # But here we warn or raise
+             warnings.warn(f"Loaded model grid has {n_extras_grid} extra dimensions, but config specifies {n_extras_config}. Predictions may be incorrect.", UserWarning)
+
         # Rebuild interpolators
         self._build_interpolators_from_grid()
 
@@ -536,9 +550,21 @@ class Decanter:
                         # Fallback to full record if empty window
                         Q_local = self.Q
                         Extras_local = self.X_extras
+                        weights = None
                     else:
                         Q_local = self.Q[mask]
                         Extras_local = self.X_extras[mask, :] if self.X_extras is not None else None
+
+                        # Weighted Integration (GFN uses tricube weights based on time distance)
+                        dist_t = self.T[mask] - t_curr
+                        w_t = self._tricube(dist_t, h_window)
+
+                        # Normalize weights
+                        if np.sum(w_t) > 0:
+                            weights = w_t / np.sum(w_t)
+                        else:
+                            # Fallback if sum is 0 (unlikely with tricube in window unless all at edge)
+                            weights = np.ones_like(w_t) / len(w_t)
 
                     # Calculate mean
                     # const_part[i] + beta1[i]*Q + ...
@@ -548,7 +574,10 @@ class Decanter:
                         for k in range(Extras_local.shape[1]):
                             pred_log += all_betas[i, 5 + k] * Extras_local[:, k]
 
-                    results.append(np.mean(np.exp(pred_log)))
+                    if weights is not None:
+                         results.append(np.sum(np.exp(pred_log) * weights))
+                    else:
+                         results.append(np.mean(np.exp(pred_log)))
 
                 return np.array(results)
 
@@ -662,6 +691,20 @@ class Decanter:
         # Prediction
 
         if use_grid:
+            # Check for Extrapolation
+            # Grid boundaries are in self.grid_axes
+            # grid_axes[0] is T, [1] is Q, etc.
+
+            # Check Time
+            t_min, t_max = self.grid_axes[0].min(), self.grid_axes[0].max()
+            if (T_new < t_min).any() or (T_new > t_max).any():
+                warnings.warn("New data contains time values outside the training grid. Extrapolation will be used.", UserWarning)
+
+            # Check Covariate
+            q_min, q_max = self.grid_axes[1].min(), self.grid_axes[1].max()
+            if (Q_new < q_min).any() or (Q_new > q_max).any():
+                 warnings.warn("New data contains covariate values outside the training grid. Extrapolation will be used.", UserWarning)
+
             # 1. Interpolate Betas
             cols = [T_new, Q_new]
             if X_extras_new is not None:
@@ -757,8 +800,15 @@ class Decanter:
                  raise ValueError(f"Unknown bootstrap method: {method}")
 
             # Create synthetic response
+            # Ensure we don't propagate NaNs from preds_log if model failed
             new_log_response = preds_log + boot_res
+
+            # If original data was NaN, keep it NaN
             new_log_response[np.isnan(self.Y)] = np.nan
+
+            # If prediction failed (NaN), we cannot create valid synthetic data for that point
+            # We treat it as NaN (missing) in the synthetic dataset
+            # (Decanter handles missing response by ignoring it in fit_local_model)
 
             df_boot = self.df.copy()
             df_boot[self.orig_response_col] = np.exp(new_log_response)
@@ -820,15 +870,10 @@ class Decanter:
         dt_forward = (df_kalman['T'] - df_kalman['Last_T']) * 365.25
         forward_res = (df_kalman['Last_Res'].fillna(0) * (rho ** dt_forward)).values
 
-        # Backward Pass
-        df_kalman['Next_Res'] = df_kalman['Res'].bfill()
-        df_kalman['Next_T'] = df_kalman['T'].where(~df_kalman['Res'].isna()).bfill()
-        df_kalman['Next_T'] = df_kalman['Next_T'].fillna(9999)
-        dt_backward = (df_kalman['Next_T'] - df_kalman['T']) * 365.25
-        backward_res = (df_kalman['Next_Res'].fillna(0) * (rho ** dt_backward)).values
+        # WRTDS-K uses Forward-Only AR(1) propagation (Causal)
+        interpolated_residuals = forward_res
 
-        # Combined Estimate
-        interpolated_residuals = (forward_res + backward_res) / 2.0
+        # Ensure observed residuals are exact
         interpolated_residuals[valid_mask] = residuals[valid_mask]
 
         return estimated_log_series + interpolated_residuals

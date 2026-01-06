@@ -17,6 +17,7 @@ Originally developed for hydrology (river water quality), this framework is gene
 *   **WRTDSplus:** Supports multiple covariates (e.g., Temperature, Lagged Flow) beyond the standard model.
 *   **WRTDS-P (Projection):** Enables "What-If" scenario analysis by integrating over simulated covariate distributions.
 *   **Uncertainty Analysis:** Provides confidence intervals via Block or Wild Bootstrap.
+*   **Note:** Handling of censored data (Tobit regression) is planned but not yet implemented.
 
 ## Installation
 
