@@ -463,5 +463,40 @@ class TestWRTDS(unittest.TestCase):
         # Expect reasonably close match (e.g. < 5% relative error)
         self.assertLess(rel_err, 0.05)
 
+    def test_get_estimated_series(self):
+        """Test the new get_estimated_series method"""
+        np.random.seed(42)
+        n = 100
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+        t0 = np.linspace(10, 20, n)
+        c0 = np.ones(n)
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # Run with Exact method
+        est_log = dec.get_estimated_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, use_grid=False)
+        self.assertEqual(len(est_log), n)
+        # Should be close to log(t0) since fit is good
+        self.assertTrue(np.allclose(est_log, np.log(t0), atol=0.2))
+
+        # Run with Grid method
+        est_log_grid = dec.get_estimated_series(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, use_grid=True)
+        self.assertEqual(len(est_log_grid), n)
+        self.assertTrue(np.allclose(est_log_grid, est_log, atol=0.1))
+
+    def test_kalman_integration(self):
+        """Test updated Kalman method with h_params"""
+        np.random.seed(42)
+        n = 100
+        dates = pd.date_range(start='2010-01-01', periods=n, freq='D')
+        t0 = np.linspace(10, 20, n)
+        c0 = np.ones(n)
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # Should be able to run without pre-computing estimate
+        corrected = dec.add_kalman_correction(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, rho=0.9)
+        self.assertEqual(len(corrected), n)
+
 if __name__ == '__main__':
     unittest.main()
