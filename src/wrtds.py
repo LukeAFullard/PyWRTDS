@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime
 from scipy.interpolate import RegularGridInterpolator
 import itertools
+import pickle
 
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None):
@@ -64,6 +65,12 @@ class Decanter:
             self.X_extras = self.df[self.extra_cov_names].values
         else:
             self.X_extras = None
+
+        # State for persistence
+        self.grid_axes = None
+        self.betas_grid = None
+        self.interpolators = None
+        self.h_params_last = None
 
     def _tricube(self, d, h):
         """
@@ -278,87 +285,153 @@ class Decanter:
     def _prepare_grid_interpolators(self, h_params, grid_config):
         """
         Helper to compute grid and create interpolators.
+        Stores them in self.interpolators.
         """
-        grid_axes, betas_grid = self.compute_grid(h_params, **grid_config)
-        n_params_grid = betas_grid.shape[-1]
-        interpolators = []
+        # If we already have a grid and it matches (assuming h_params unchanged if not checking),
+        # but for safety we recompute if called via public methods unless explicitly managed.
+        # But here we just compute.
+
+        self.grid_axes, self.betas_grid = self.compute_grid(h_params, **grid_config)
+        self.h_params_last = h_params
+        self._build_interpolators_from_grid()
+
+        return self.interpolators
+
+    def _build_interpolators_from_grid(self):
+        """
+        Reconstructs interpolators from self.grid_axes and self.betas_grid.
+        """
+        if self.grid_axes is None or self.betas_grid is None:
+            return
+
+        n_params_grid = self.betas_grid.shape[-1]
+        self.interpolators = []
 
         for k in range(n_params_grid):
-            grid_slice = betas_grid[..., k]
+            grid_slice = self.betas_grid[..., k]
 
             # Legacy 2D filling
-            if len(grid_axes) == 2:
+            if len(self.grid_axes) == 2:
                 grid_slice_df = pd.DataFrame(grid_slice)
                 grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
 
-            # Remove the 0.0 fill.
-            # If NaNs remain, RegularGridInterpolator will return NaNs for those cells.
+            interp = RegularGridInterpolator(self.grid_axes, grid_slice, bounds_error=False, fill_value=None)
+            self.interpolators.append(interp)
 
-            interp = RegularGridInterpolator(grid_axes, grid_slice, bounds_error=False, fill_value=None)
-            interpolators.append(interp)
+    def save_model(self, filepath):
+        """
+        Saves the fitted grid and parameters to a file.
+        Only saves the lightweight grid data, not the full original dataframe.
+        """
+        if self.grid_axes is None:
+            raise ValueError("No model fitted. Run decant_series with use_grid=True first.")
 
-        return interpolators
+        state = {
+            'grid_axes': self.grid_axes,
+            'betas_grid': self.betas_grid,
+            'h_params': self.h_params_last,
+            'extra_cov_config': self.extra_cov_config,
+            'orig_covariate_col': self.orig_covariate_col,
+            'orig_response_col': self.orig_response_col,
+            'orig_date_col': self.orig_date_col,
+            # We need Q (historical distribution) for decanting, so we must save it.
+            'history_Q': self.Q,
+            'history_X_extras': self.X_extras
+        }
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(state, f)
+
+    def load_model(self, filepath):
+        """
+        Loads a fitted grid from a file.
+        """
+        with open(filepath, 'rb') as f:
+            state = pickle.load(f)
+
+        self.grid_axes = state['grid_axes']
+        self.betas_grid = state['betas_grid']
+        self.h_params_last = state['h_params']
+        self.extra_cov_config = state.get('extra_cov_config', [])
+
+        # Restore historical distribution for integration
+        self.Q = state.get('history_Q')
+        self.X_extras = state.get('history_X_extras')
+
+        # Rebuild interpolators
+        self._build_interpolators_from_grid()
 
     def get_estimated_series(self, h_params, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
         """
         Returns the model predictions (in log space) for the observed data points.
         This represents the "trend + seasonality + flow effect" component.
         """
-        preds_log = []
-
-        interpolators = None
         if use_grid:
-            interpolators = self._prepare_grid_interpolators(h_params, grid_config)
+            if self.interpolators is None:
+                self._prepare_grid_interpolators(h_params, grid_config)
 
-        for i, row in self.df.iterrows():
-            t_current = row['decimal_time']
-            q_current = row['log_covariate']
-
-            extras_current = None
+            # Vectorized Interpolation
+            # Construct points array (N, D)
+            cols = [self.T, self.Q]
             if self.X_extras is not None:
-                extras_current = self.X_extras[i, :]
+                for k in range(self.X_extras.shape[1]):
+                    cols.append(self.X_extras[:, k])
 
-            betas = None
-            if use_grid:
-                # Interpolate
-                pt_list = [t_current, q_current]
-                if extras_current is not None:
-                    pt_list.extend(extras_current)
-                pts = np.array([pt_list])
+            pts = np.column_stack(cols)
 
-                try:
-                    betas = np.array([interp(pts)[0] for interp in interpolators])
-                except Exception:
-                    betas = None
+            # Predict all betas at once: (N, n_betas)
+            # List comprehension over interpolators
+            betas_cols = [interp(pts) for interp in self.interpolators]
+            all_betas = np.column_stack(betas_cols)
 
-                if betas is None or np.isnan(betas).any():
-                    betas = None
-            else:
-                 s_current = row['season']
-                 betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
+            # Calculate predictions vectorized
+            # beta0 + beta1*Q + beta2*t + beta3*sin + beta4*cos
+            pred = (all_betas[:, 0] +
+                    all_betas[:, 1] * self.Q +
+                    all_betas[:, 2] * self.T +
+                    all_betas[:, 3] * np.sin(2 * np.pi * self.T) +
+                    all_betas[:, 4] * np.cos(2 * np.pi * self.T))
 
-            if betas is None:
-                preds_log.append(np.nan)
-            else:
-                # Predict in log space
-                val = self.predict_point(t_current, q_current, betas, extras_current, return_log=True)
-                preds_log.append(val)
+            # Extras
+            if self.X_extras is not None:
+                for k in range(self.X_extras.shape[1]):
+                    pred += all_betas[:, 5 + k] * self.X_extras[:, k]
 
-        return np.array(preds_log)
+            return pred
+
+        else:
+            # Exact method (Loop)
+            preds_log = []
+            for i, row in self.df.iterrows():
+                t_current = row['decimal_time']
+                q_current = row['log_covariate']
+                s_current = row['season']
+
+                extras_current = None
+                if self.X_extras is not None:
+                    extras_current = self.X_extras[i, :]
+
+                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
+
+                if betas is None:
+                    preds_log.append(np.nan)
+                else:
+                    # Predict in log space
+                    val = self.predict_point(t_current, q_current, betas, extras_current, return_log=True)
+                    preds_log.append(val)
+
+            return np.array(preds_log)
 
     def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None, integration_scenarios=None):
         """
         Generates the cleaned time series t1 (Flow Normalized).
         """
-        results = []
-
         # Pre-process integration scenarios
         Q_scenario = None
         Extras_scenario = None
 
         if integration_scenarios is not None:
             # Transform scenario to Log Space
-            # Primary Covariate
             q_raw = integration_scenarios[self.orig_covariate_col]
             if (q_raw <= 0).any():
                  raise ValueError("Integration scenario primary covariate must be strictly positive.")
@@ -379,96 +452,265 @@ class Decanter:
                         Extras_scenario_list.append(vals.values)
                 Extras_scenario = np.column_stack(Extras_scenario_list)
 
-        interpolators = None
         if use_grid:
-            interpolators = self._prepare_grid_interpolators(h_params, grid_config)
+            print(f"Starting Decanting Process (Method: Grid)...")
+            if self.interpolators is None:
+                self._prepare_grid_interpolators(h_params, grid_config)
 
-        print(f"Starting Decanting Process (Method: {'Grid' if use_grid else 'Exact'})...")
-
-        for i, row in self.df.iterrows():
-            t_current = row['decimal_time']
-            s_current = row['season']
-            q_current = row['log_covariate']
-
-            # Extract extras for this row if they exist
-            extras_current = None
+            # 1. Vectorized Beta Interpolation
+            cols = [self.T, self.Q]
             if self.X_extras is not None:
-                extras_current = self.X_extras[i, :]
+                for k in range(self.X_extras.shape[1]):
+                    cols.append(self.X_extras[:, k])
+            pts = np.column_stack(cols)
 
-            betas = None
+            # (N_samples, N_betas)
+            all_betas = np.column_stack([interp(pts) for interp in self.interpolators])
 
-            if use_grid:
-                # Interpolate betas
-                # Input to interpolator is (t, q, [extras...])
-                pt_list = [t_current, q_current]
-                if extras_current is not None:
-                    pt_list.extend(extras_current)
+            # 2. Vectorized Integration
+            # Formula: beta0 + beta1*Q_hist + beta2*t + ...
 
-                pts = np.array([pt_list])
+            # Constant part per time step
+            const_part = (all_betas[:, 0] +
+                          all_betas[:, 2] * self.T +
+                          all_betas[:, 3] * np.sin(2*np.pi*self.T) +
+                          all_betas[:, 4] * np.cos(2*np.pi*self.T))
 
-                try:
-                    betas = np.array([interp(pts)[0] for interp in interpolators])
-                except Exception:
-                    # In case of dimension mismatch or other interp error
-                    betas = None
+            # Identify Integration Source (Q_integration)
+            # Three cases: Stationary, Scenarios, GFN
 
-                if betas is None or np.isnan(betas).any():
-                    betas = None
+            # Case A: Scenarios or Stationary (Constant Integration Vector)
+            if gfn_window is None:
+                if integration_scenarios is not None:
+                    Q_integ = Q_scenario
+                    Extras_integ = Extras_scenario
+                else:
+                    Q_integ = self.Q
+                    Extras_integ = self.X_extras
+
+                # Covariate Part: Matrix Multiplication
+                # (N_samples, 1) * (1, N_integration_points) -> (N_samples, N_integration_points)
+                # But to save memory, we can do it row-wise or broadcast if N*M is small.
+                # Let's try broadcasting but be mindful of memory.
+
+                # If N*M > 10^8 (e.g. 10k * 10k), we should loop/batch.
+                # Assuming typical use (daily data for 10-20 years ~ 7000 points).
+                # 7000*7000 = 49M doubles = ~400MB. Safe.
+
+                term_cov = all_betas[:, 1][:, np.newaxis] * Q_integ[np.newaxis, :]
+
+                term_extras = 0
+                if Extras_integ is not None:
+                    for k in range(Extras_integ.shape[1]):
+                        # beta_ext * Ext_hist
+                        # Beta index is 5 + k
+                        b = all_betas[:, 5 + k][:, np.newaxis]
+                        e = Extras_integ[:, k][np.newaxis, :]
+                        term_extras += b * e
+
+                log_preds = const_part[:, np.newaxis] + term_cov + term_extras
+                results = np.nanmean(np.exp(log_preds), axis=1)
+
+                # If betas were nan, results are nan.
+                return results
+
             else:
-                # Exact calculation
+                # Case B: GFN (Windowed) - Integration set changes per row
+                # We have pre-computed betas, but we must loop for integration
+                # to select the window.
+                h_window = gfn_window / 2
+                results = []
+                n = len(self.df)
+
+                for i in range(n):
+                    if np.isnan(all_betas[i, 0]):
+                        results.append(np.nan)
+                        continue
+
+                    t_curr = self.T[i]
+                    # Select window
+                    # This boolean masking is somewhat slow but much faster than fitting
+                    mask = np.abs(self.T - t_curr) <= h_window
+
+                    if not np.any(mask):
+                        # Fallback to full record if empty window
+                        Q_local = self.Q
+                        Extras_local = self.X_extras
+                    else:
+                        Q_local = self.Q[mask]
+                        Extras_local = self.X_extras[mask, :] if self.X_extras is not None else None
+
+                    # Calculate mean
+                    # const_part[i] + beta1[i]*Q + ...
+                    pred_log = const_part[i] + all_betas[i, 1] * Q_local
+
+                    if Extras_local is not None:
+                        for k in range(Extras_local.shape[1]):
+                            pred_log += all_betas[i, 5 + k] * Extras_local[:, k]
+
+                    results.append(np.mean(np.exp(pred_log)))
+
+                return np.array(results)
+
+        else:
+            # Exact Method (Loop)
+            print(f"Starting Decanting Process (Method: Exact)...")
+            results = []
+            for i, row in self.df.iterrows():
+                t_current = row['decimal_time']
+                s_current = row['season']
+                q_current = row['log_covariate']
+
+                # Extract extras for this row if they exist
+                extras_current = None
+                if self.X_extras is not None:
+                    extras_current = self.X_extras[i, :]
+
                 betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
 
-            if betas is None:
-                results.append(np.nan)
-                continue
+                if betas is None:
+                    results.append(np.nan)
+                    continue
 
-            # Flow Normalization (Integration)
-            # Formula: beta0 + beta1*Q_hist + beta2*t + ... + beta_ext * Ext_hist
-            const_part = (betas[0] +
-                          betas[2] * t_current +
-                          betas[3] * np.sin(2*np.pi*t_current) +
-                          betas[4] * np.cos(2*np.pi*t_current))
+                # Flow Normalization (Integration)
+                const_part = (betas[0] +
+                              betas[2] * t_current +
+                              betas[3] * np.sin(2*np.pi*t_current) +
+                              betas[4] * np.cos(2*np.pi*t_current))
 
-            # Select covariates for integration
-            if integration_scenarios is not None:
-                # WRTDS-P
-                Q_integration = Q_scenario
-                Extras_integration = Extras_scenario
-            elif gfn_window is not None:
-                # Generalized Flow Normalization (Windowed)
-                h_window = gfn_window / 2
-                mask = np.abs(self.T - t_current) <= h_window
-                Q_integration = self.Q[mask]
+                # Select covariates for integration
+                if integration_scenarios is not None:
+                    Q_integration = Q_scenario
+                    Extras_integration = Extras_scenario
+                elif gfn_window is not None:
+                    h_window = gfn_window / 2
+                    mask = np.abs(self.T - t_current) <= h_window
+                    Q_integration = self.Q[mask]
+                    if self.X_extras is not None:
+                        Extras_integration = self.X_extras[mask, :]
+                    if len(Q_integration) == 0:
+                         Q_integration = self.Q
+                         if self.X_extras is not None:
+                             Extras_integration = self.X_extras
+                else:
+                    Q_integration = self.Q
+                    if self.X_extras is not None:
+                        Extras_integration = self.X_extras
+
+                cov_part = betas[1] * Q_integration
+
+                extra_part = 0
                 if self.X_extras is not None:
-                    Extras_integration = self.X_extras[mask, :]
+                    for k in range(len(self.extra_cov_config)):
+                        beta_val = betas[5 + k]
+                        col_vals = Extras_integration[:, k]
+                        extra_part += beta_val * col_vals
 
-                # If window is empty
-                if len(Q_integration) == 0:
-                     Q_integration = self.Q
-                     if self.X_extras is not None:
-                         Extras_integration = self.X_extras
-            else:
-                # Stationary Flow Normalization (Full Record)
-                Q_integration = self.Q
-                if self.X_extras is not None:
-                    Extras_integration = self.X_extras
+                predictions_log = const_part + cov_part + extra_part
+                predictions = np.exp(predictions_log)
+                t1_val = np.mean(predictions)
+                results.append(t1_val)
 
-            cov_part = betas[1] * Q_integration
+            return results
 
-            # Add Extra Covariates Contribution
-            extra_part = 0
+    def predict(self, new_data_df, use_grid=True):
+        """
+        Out-of-sample prediction using the fitted model.
+        Returns a DataFrame with 'estimated' (point prediction) and 'decanted' (flow normalized) columns.
+        """
+        if use_grid and self.interpolators is None:
+             raise ValueError("Model grid not found. Run decant_series(use_grid=True) or load_model() first.")
+
+        # Prepare new data
+        # We need derived columns: decimal_time, log_covariate, extras
+
+        df_new = new_data_df.copy()
+
+        # Check required columns
+        req_cols = [self.orig_date_col, self.orig_covariate_col]
+        for c in req_cols:
+            if c not in df_new.columns:
+                raise ValueError(f"New data missing column: {c}")
+
+        # Transform
+        df_new['date'] = pd.to_datetime(df_new[self.orig_date_col])
+        df_new['decimal_time'] = df_new['date'].dt.year + (df_new['date'].dt.dayofyear - 1) / 365.25
+
+        if (df_new[self.orig_covariate_col] <= 0).any():
+             raise ValueError("New data contains non-positive covariate values.")
+        df_new['log_covariate'] = np.log(df_new[self.orig_covariate_col])
+
+        T_new = df_new['decimal_time'].values
+        Q_new = df_new['log_covariate'].values
+
+        X_extras_new = None
+        if self.extra_cov_config:
+            extra_vals = []
+            for conf in self.extra_cov_config:
+                col = conf['col']
+                if col not in df_new.columns:
+                     raise ValueError(f"New data missing extra covariate: {col}")
+
+                is_log = conf.get('log', False)
+                vals = df_new[col].values
+                if is_log:
+                     if (vals <= 0).any(): raise ValueError("Non-positive extra covariate.")
+                     vals = np.log(vals)
+                extra_vals.append(vals)
+            X_extras_new = np.column_stack(extra_vals)
+
+        # Prediction
+
+        if use_grid:
+            # 1. Interpolate Betas
+            cols = [T_new, Q_new]
+            if X_extras_new is not None:
+                for k in range(X_extras_new.shape[1]):
+                    cols.append(X_extras_new[:, k])
+            pts = np.column_stack(cols)
+
+            # (N_new, N_betas)
+            all_betas = np.column_stack([interp(pts) for interp in self.interpolators])
+
+            # 2. Estimated Series (Point prediction)
+            est_log = (all_betas[:, 0] +
+                       all_betas[:, 1] * Q_new +
+                       all_betas[:, 2] * T_new +
+                       all_betas[:, 3] * np.sin(2 * np.pi * T_new) +
+                       all_betas[:, 4] * np.cos(2 * np.pi * T_new))
+
+            if X_extras_new is not None:
+                for k in range(X_extras_new.shape[1]):
+                    est_log += all_betas[:, 5 + k] * X_extras_new[:, k]
+
+            estimated = np.exp(est_log)
+
+            # 3. Decanted Series (Stationary Normalization)
+            # Integrate over HISTORICAL Q (self.Q), not new data Q.
+            # Assuming Stationary Flow Normalization.
+
+            const_part = (all_betas[:, 0] +
+                          all_betas[:, 2] * T_new +
+                          all_betas[:, 3] * np.sin(2*np.pi*T_new) +
+                          all_betas[:, 4] * np.cos(2*np.pi*T_new))
+
+            # Broadcasting: (N_new, 1) + (N_new, 1) * (1, M_hist) ...
+            term_cov = all_betas[:, 1][:, np.newaxis] * self.Q[np.newaxis, :]
+
+            term_extras = 0
             if self.X_extras is not None:
-                for k in range(len(self.extra_cov_config)):
-                    beta_val = betas[5 + k]
-                    col_vals = Extras_integration[:, k]
-                    extra_part += beta_val * col_vals
+                for k in range(self.X_extras.shape[1]):
+                    b = all_betas[:, 5 + k][:, np.newaxis]
+                    e = self.X_extras[:, k][np.newaxis, :]
+                    term_extras += b * e
 
-            predictions_log = const_part + cov_part + extra_part
-            predictions = np.exp(predictions_log)
-            t1_val = np.mean(predictions)
-            results.append(t1_val)
+            log_preds = const_part[:, np.newaxis] + term_cov + term_extras
+            decanted = np.nanmean(np.exp(log_preds), axis=1)
 
-        return results
+            return pd.DataFrame({'estimated': estimated, 'decanted': decanted}, index=df_new.index)
+
+        else:
+             raise NotImplementedError("Out-of-sample prediction only supported for Grid method.")
 
     def bootstrap_uncertainty(self, h_params, n_bootstraps=100, block_size=30, use_grid=True, grid_config={'n_t':100, 'n_q':15}, method='block'):
         """
@@ -524,6 +766,7 @@ class Decanter:
             dec_boot = Decanter(df_boot, self.orig_date_col, self.orig_response_col, self.orig_covariate_col, extra_covariates=self.extra_cov_config)
 
             # Re-run decant
+            # Important: dec_boot will recompute its own grid since we re-init
             res = dec_boot.decant_series(h_params, use_grid=use_grid, grid_config=grid_config)
             results_matrix[b, :] = res
 
