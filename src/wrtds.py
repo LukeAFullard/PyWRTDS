@@ -173,7 +173,7 @@ class Decanter:
         except np.linalg.LinAlgError:
             return None
 
-    def predict_point(self, t_target, q_target, betas, extras_target=None):
+    def predict_point(self, t_target, q_target, betas, extras_target=None, return_log=False):
         """
         Predicts value using the locally fitted betas.
         """
@@ -194,6 +194,8 @@ class Decanter:
             for i, val in enumerate(extras_target):
                 prediction_log += betas[5 + i] * val
 
+        if return_log:
+            return prediction_log
         return np.exp(prediction_log) # Return to linear space
 
     def compute_grid(self, h_params, n_t=100, n_q=15, n_extra=7):
@@ -273,21 +275,84 @@ class Decanter:
 
         return tuple(grid_axes), betas_grid
 
+    def _prepare_grid_interpolators(self, h_params, grid_config):
+        """
+        Helper to compute grid and create interpolators.
+        """
+        grid_axes, betas_grid = self.compute_grid(h_params, **grid_config)
+        n_params_grid = betas_grid.shape[-1]
+        interpolators = []
+
+        for k in range(n_params_grid):
+            grid_slice = betas_grid[..., k]
+
+            # Legacy 2D filling
+            if len(grid_axes) == 2:
+                grid_slice_df = pd.DataFrame(grid_slice)
+                grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
+
+            # Remove the 0.0 fill.
+            # If NaNs remain, RegularGridInterpolator will return NaNs for those cells.
+
+            interp = RegularGridInterpolator(grid_axes, grid_slice, bounds_error=False, fill_value=None)
+            interpolators.append(interp)
+
+        return interpolators
+
+    def get_estimated_series(self, h_params, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
+        """
+        Returns the model predictions (in log space) for the observed data points.
+        This represents the "trend + seasonality + flow effect" component.
+        """
+        preds_log = []
+
+        interpolators = None
+        if use_grid:
+            interpolators = self._prepare_grid_interpolators(h_params, grid_config)
+
+        for i, row in self.df.iterrows():
+            t_current = row['decimal_time']
+            q_current = row['log_covariate']
+
+            extras_current = None
+            if self.X_extras is not None:
+                extras_current = self.X_extras[i, :]
+
+            betas = None
+            if use_grid:
+                # Interpolate
+                pt_list = [t_current, q_current]
+                if extras_current is not None:
+                    pt_list.extend(extras_current)
+                pts = np.array([pt_list])
+
+                try:
+                    betas = np.array([interp(pts)[0] for interp in interpolators])
+                except Exception:
+                    betas = None
+
+                if betas is None or np.isnan(betas).any():
+                    betas = None
+            else:
+                 s_current = row['season']
+                 betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
+
+            if betas is None:
+                preds_log.append(np.nan)
+            else:
+                # Predict in log space
+                val = self.predict_point(t_current, q_current, betas, extras_current, return_log=True)
+                preds_log.append(val)
+
+        return np.array(preds_log)
+
     def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None, integration_scenarios=None):
         """
         Generates the cleaned time series t1 (Flow Normalized).
-        If use_grid=True, it computes a regression surface and interpolates betas.
-
-        gfn_window: float (years). If provided, performs Generalized Flow Normalization (GFN)
-                    by integrating over covariate values only within [t - gfn_window/2, t + gfn_window/2].
-
-        integration_scenarios: pandas DataFrame (optional). WRTDS-P (Projection).
-                    If provided, these values are used for the integration step instead of the historical
-                    covariate record. Must contain columns matching the original covariate names.
         """
         results = []
 
-        # Pre-process integration scenarios if provided
+        # Pre-process integration scenarios
         Q_scenario = None
         Extras_scenario = None
 
@@ -314,53 +379,9 @@ class Decanter:
                         Extras_scenario_list.append(vals.values)
                 Extras_scenario = np.column_stack(Extras_scenario_list)
 
-        interpolator = None
+        interpolators = None
         if use_grid:
-            grid_axes, betas_grid = self.compute_grid(h_params, **grid_config)
-
-            # The last dimension of betas_grid is the parameter dimension
-            n_params_grid = betas_grid.shape[-1]
-
-            # Create an interpolator for each beta coefficient
-            # RegularGridInterpolator requires points to be strictly ascending (linspace ensures this)
-            # We create a list of interpolators
-            interpolators = []
-
-            # Helper to fill NaNs in N-D array
-            # Simple approach: Iterate axes and ffill/bfill?
-            # Or just assume dense enough grid.
-            # For 2D we used pandas. For ND pandas is harder.
-            # Let's rely on standard assumption that WRTDS grid is dense enough.
-            # If strictly needed, we can implement N-D filling, but it's complex.
-            # Fallback: fill with 0 or mean? NaNs will cause interpolation to fail or be NaN.
-            # Let's replace NaNs with 0 for now to prevent crash, though it's suboptimal.
-            # Ideally we'd use 'nearest' but RegularGridInterpolator doesn't infer.
-            if np.isnan(betas_grid).any():
-                # mask = np.isnan(betas_grid)
-                # betas_grid[mask] = 0 # Dangerous?
-                # Better: Allow NaNs to propagate to predictions (so we know where data is missing)
-                pass
-
-            for k in range(n_params_grid):
-                # Slice the grid for the k-th beta
-                # The values array passed to RGI must match grid dims.
-                # betas_grid shape is (n_t, n_q, ..., n_params)
-                # We need (n_t, n_q, ...)
-                grid_slice = betas_grid[..., k]
-
-                # Handling NaNs in 2D case legacy:
-                if len(grid_axes) == 2:
-                     grid_slice_df = pd.DataFrame(grid_slice)
-                     grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
-
-                # Check for NaNs again
-                if np.isnan(grid_slice).any():
-                     # If we still have NaNs (ND case or sparse 2D), fill with 0 to allow interp to run
-                     # Real solution: better grid filling logic
-                     grid_slice[np.isnan(grid_slice)] = 0.0
-
-                interp = RegularGridInterpolator(grid_axes, grid_slice, bounds_error=False, fill_value=None)
-                interpolators.append(interp)
+            interpolators = self._prepare_grid_interpolators(h_params, grid_config)
 
         print(f"Starting Decanting Process (Method: {'Grid' if use_grid else 'Exact'})...")
 
@@ -409,11 +430,6 @@ class Decanter:
                           betas[4] * np.cos(2*np.pi*t_current))
 
             # Select covariates for integration
-            # Priority:
-            # 1. Custom Scenario (WRTDS-P) -> Uses provided distribution (Stationary over the scenario)
-            # 2. GFN (Windowed History)
-            # 3. SFN (Full History)
-
             if integration_scenarios is not None:
                 # WRTDS-P
                 Q_integration = Q_scenario
@@ -426,7 +442,7 @@ class Decanter:
                 if self.X_extras is not None:
                     Extras_integration = self.X_extras[mask, :]
 
-                # If window is empty (shouldn't happen with reasonable data), fallback to full
+                # If window is empty
                 if len(Q_integration) == 0:
                      Q_integration = self.Q
                      if self.X_extras is not None:
@@ -442,9 +458,6 @@ class Decanter:
             # Add Extra Covariates Contribution
             extra_part = 0
             if self.X_extras is not None:
-                # betas[5:] are for extras
-                # We need to dot product betas[5:] with columns of Extras_integration
-                # Note: If we have custom scenarios, Extras_integration is set correctly above
                 for k in range(len(self.extra_cov_config)):
                     beta_val = betas[5 + k]
                     col_vals = Extras_integration[:, k]
@@ -457,7 +470,7 @@ class Decanter:
 
         return results
 
-    def bootstrap_uncertainty(self, h_params, n_bootstraps=100, block_size=30, use_grid=True, method='block'):
+    def bootstrap_uncertainty(self, h_params, n_bootstraps=100, block_size=30, use_grid=True, grid_config={'n_t':100, 'n_q':15}, method='block'):
         """
         Estimates uncertainty bands using Bootstrap on residuals.
 
@@ -469,78 +482,7 @@ class Decanter:
 
         # 1. Calculate Initial Residuals (from Grid model)
         # We need the estimated values (NOT flow normalized) to get residuals
-        # Ideally we reuse a grid if computed
-        if use_grid:
-            # Note: We do not pass grid_config here, using default.
-            # Ideally should expose grid_config to bootstrap_uncertainty too.
-            grid_axes, betas_grid = self.compute_grid(h_params)
-            n_params_grid = betas_grid.shape[-1]
-
-            interpolators = []
-            for k in range(n_params_grid):
-                grid_slice = betas_grid[..., k]
-
-                # Legacy 2D filling
-                if len(grid_axes) == 2:
-                    grid_slice_df = pd.DataFrame(grid_slice)
-                    grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
-
-                if np.isnan(grid_slice).any():
-                     grid_slice[np.isnan(grid_slice)] = 0.0
-
-                interp = RegularGridInterpolator(grid_axes, grid_slice, bounds_error=False, fill_value=None)
-                interpolators.append(interp)
-
-            # Predict for every point to get residuals
-            preds_log = []
-            for i, row in self.df.iterrows():
-                # Construct pt: t, q, [extras]
-                pt_list = [row['decimal_time'], row['log_covariate']]
-
-                extras_current = None
-                if self.X_extras is not None:
-                    extras_current = self.X_extras[i, :]
-                    pt_list.extend(extras_current)
-
-                pts = np.array([pt_list])
-
-                try:
-                    betas = np.array([interp(pts)[0] for interp in interpolators])
-                except Exception:
-                    betas = None
-
-                if betas is None or np.isnan(betas).any():
-                     preds_log.append(np.nan)
-                else:
-                    # Calculate prediction
-                    val = self.predict_point(row['decimal_time'], row['log_covariate'], betas, extras_current)
-                    preds_log.append(np.log(val)) # Store in log space for residual calc
-
-            preds_log = np.array(preds_log)
-        else:
-            # Non-grid (Exact) calculation
-            # We must iterate over all points and fit local model to get predictions
-            preds_log = []
-            for i, row in self.df.iterrows():
-                t_current = row['decimal_time']
-                s_current = row['season']
-                q_current = row['log_covariate']
-
-                # Extract extras
-                extras_current = None
-                if self.X_extras is not None:
-                    extras_current = self.X_extras[i, :]
-
-                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
-
-                if betas is None:
-                    preds_log.append(np.nan)
-                else:
-                    val = self.predict_point(t_current, q_current, betas, extras_current)
-                    # predict_point returns exp (linear space), but we need log space for residuals
-                    preds_log.append(np.log(val))
-
-            preds_log = np.array(preds_log)
+        preds_log = self.get_estimated_series(h_params, use_grid=use_grid, grid_config=grid_config)
 
         residuals = self.Y - preds_log
 
@@ -557,31 +499,14 @@ class Decanter:
             boot_res = np.zeros(n)
 
             if method == 'wild':
-                # Wild Bootstrap: Preserve local residual, multiply by random variable
-                # Rademacher: +1 or -1 with p=0.5
-                # Allows handling heteroscedasticity
                 flips = np.random.choice([-1, 1], size=n)
-                # Keep NaNs as NaNs (multiplication by +/-1 preserves NaN)
                 boot_res = residuals * flips
 
             elif method == 'block':
-                # Block Bootstrap: Resample blocks from valid residuals
-                # Note: This destroys correspondence with Time if gaps exist,
-                # effectively assuming homoscedasticity.
                 current_idx = 0
                 while current_idx < n:
-                    # Pick random start from VALID residuals
                     start = np.random.randint(0, len(valid_res) - block_size)
                     chunk = valid_res[start : start + block_size]
-
-                    # Fill the bootstrap vector
-                    # Note: We are filling sequentially. If the original series had gaps,
-                    # this "compacts" the residuals. But we map them to the full time series 1-to-1?
-                    # No, usually we map index i -> index i.
-                    # Ideally, we should resample blocks of INDICES from the original series,
-                    # keeping the (NaN) structure if a block contains NaNs.
-                    # But standard practice often just resamples the errors.
-
                     end_idx = min(current_idx + block_size, n)
                     needed = end_idx - current_idx
                     boot_res[current_idx : end_idx] = chunk[:needed]
@@ -590,33 +515,16 @@ class Decanter:
                  raise ValueError(f"Unknown bootstrap method: {method}")
 
             # Create synthetic response
-            # New Y = Pred + Resampled Residual
             new_log_response = preds_log + boot_res
-
-            # Enforce Missingness Pattern:
-            # If original Y was NaN, synthetic Y must be NaN.
-            # This prevents "filling in" gaps which would artificially lower uncertainty.
             new_log_response[np.isnan(self.Y)] = np.nan
 
-            # Create temporary Decanter for this run
-            # We assume Covariate and Time are fixed (Fixed-X resampling)
             df_boot = self.df.copy()
-
-            # Update the ORIGINAL response column with the new synthetic data (inverse log)
-            # This ensures that when we re-init Decanter, it logs it back correctly to 'log_response'
-            # and performs the positive check.
-            # Handle NaNs: exp(NaN) = NaN.
             df_boot[self.orig_response_col] = np.exp(new_log_response)
 
-            # Re-initialize using original column names
-            # We must also pass the extra covariates config if it existed
             dec_boot = Decanter(df_boot, self.orig_date_col, self.orig_response_col, self.orig_covariate_col, extra_covariates=self.extra_cov_config)
 
-            # Run Decant
-            # We pass the PRE-COMPUTED grid config to save time?
-            # No, we must re-compute grid because Y changed.
-            # If use_grid was False, we must continue using False
-            res = dec_boot.decant_series(h_params, use_grid=use_grid)
+            # Re-run decant
+            res = dec_boot.decant_series(h_params, use_grid=use_grid, grid_config=grid_config)
             results_matrix[b, :] = res
 
         # 3. Aggregate
@@ -628,14 +536,24 @@ class Decanter:
 
         return df_results
 
-    def add_kalman_correction(self, estimated_log_series, rho=0.9):
+    def add_kalman_correction(self, estimated_log_series=None, h_params=None, rho=0.9, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
         """
         Applies WRTDS-Kalman correction (AR1 filtering of residuals).
-        estimated_log_series: array of log-space predictions from WRTDS (NOT flow normalized)
-        rho: autocorrelation coefficient (0.8 - 0.95 typical)
+
+        Args:
+            estimated_log_series: array of log-space predictions. If None, computed via h_params.
+            h_params: dict of WRTDS parameters. Required if estimated_log_series is None.
+            rho: autocorrelation coefficient (0.8 - 0.95 typical)
+            use_grid: bool, for on-the-fly estimation
+            grid_config: dict, for on-the-fly estimation
 
         Returns: series with Kalman correction applied (in log space).
         """
+        if estimated_log_series is None:
+             if h_params is None:
+                 raise ValueError("Must provide either estimated_log_series or h_params")
+             estimated_log_series = self.get_estimated_series(h_params, use_grid, grid_config)
+
         # Calculate residuals where we have observations
         # res = log_obs - log_model
 
@@ -647,45 +565,27 @@ class Decanter:
         residuals[valid_mask] = self.Y[valid_mask] - estimated_log_series[valid_mask]
 
         # Interpolate residuals to all days using AR(1) decay via Vectorized operations
-        # Create DataFrame for easy ffill/bfill
         df_kalman = pd.DataFrame({
             'T': self.T,
             'Res': residuals
         })
 
         # Forward Pass
-        # 1. Forward fill the valid residuals and their timestamps
         df_kalman['Last_Res'] = df_kalman['Res'].ffill()
         df_kalman['Last_T'] = df_kalman['T'].where(~df_kalman['Res'].isna()).ffill()
-
-        # 2. Calculate dt from last valid observation
-        # Fill NaNs in Last_T with a dummy distant past if starts with NaN
         df_kalman['Last_T'] = df_kalman['Last_T'].fillna(-9999)
         dt_forward = (df_kalman['T'] - df_kalman['Last_T']) * 365.25
-
-        # 3. Apply decay
-        # For valid points, dt is 0, so rho^0 = 1 -> returns Res
-        # We fill initial NaNs (before first obs) with 0
         forward_res = (df_kalman['Last_Res'].fillna(0) * (rho ** dt_forward)).values
 
         # Backward Pass
-        # 1. Backward fill
         df_kalman['Next_Res'] = df_kalman['Res'].bfill()
         df_kalman['Next_T'] = df_kalman['T'].where(~df_kalman['Res'].isna()).bfill()
-
-        # 2. Calculate dt to next valid observation
         df_kalman['Next_T'] = df_kalman['Next_T'].fillna(9999)
         dt_backward = (df_kalman['Next_T'] - df_kalman['T']) * 365.25
-
-        # 3. Apply decay
         backward_res = (df_kalman['Next_Res'].fillna(0) * (rho ** dt_backward)).values
 
         # Combined Estimate
-        # Average the forward and backward projections
         interpolated_residuals = (forward_res + backward_res) / 2.0
-
-        # Enforce exact match on valid observations (though the formula rho^0=1 guarantees it)
-        # Just to be safe against floating point noise
         interpolated_residuals[valid_mask] = residuals[valid_mask]
 
         return estimated_log_series + interpolated_residuals
