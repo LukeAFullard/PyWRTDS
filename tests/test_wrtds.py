@@ -3,6 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 import unittest
+import tempfile
+import shutil
 
 # Ensure src is in path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
@@ -28,6 +30,11 @@ class TestWRTDS(unittest.TestCase):
         t0 = true_trend * c0 * np.random.normal(1, 0.1, n)
 
         self.df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
 
     def test_decanter_init(self):
         dec = Decanter(self.df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
@@ -497,6 +504,80 @@ class TestWRTDS(unittest.TestCase):
         # Should be able to run without pre-computing estimate
         corrected = dec.add_kalman_correction(h_params={'h_time': 2, 'h_cov': 2, 'h_season': 0.5}, rho=0.9)
         self.assertEqual(len(corrected), n)
+
+    def test_persistence(self):
+        """Test save_model and load_model"""
+        np.random.seed(42)
+        n = 50
+        dates = pd.date_range(start='2020-01-01', periods=n, freq='D')
+        t0 = np.linspace(10, 20, n)
+        c0 = np.ones(n)
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+
+        # Fit via decant_series with grid
+        h_params = {'h_time': 2, 'h_cov': 2, 'h_season': 0.5}
+        dec.decant_series(h_params, use_grid=True)
+
+        filepath = os.path.join(self.test_dir, 'model.pkl')
+        dec.save_model(filepath)
+
+        # New instance
+        dec2 = Decanter(df, date_col='Date', response_col='Sales', covariate_col='AdSpend')
+        dec2.load_model(filepath)
+
+        # Check if loaded state matches
+        self.assertIsNotNone(dec2.grid_axes)
+        self.assertIsNotNone(dec2.interpolators)
+        self.assertEqual(dec2.h_params_last, h_params)
+
+        # Verify predictions match
+        est1 = dec.get_estimated_series(h_params, use_grid=True)
+        est2 = dec2.get_estimated_series(h_params, use_grid=True)
+
+        self.assertTrue(np.allclose(est1, est2, equal_nan=True))
+
+    def test_out_of_sample_predict(self):
+        """Test predict() method"""
+        np.random.seed(42)
+        n_train = 50
+        dates = pd.date_range(start='2020-01-01', periods=n_train, freq='D')
+        c0 = np.random.uniform(10, 50, n_train)
+        # Simple relationship: Sales = 2 * AdSpend
+        t0 = c0 * 2.0
+
+        df = pd.DataFrame({'Date': dates, 'Sales': t0, 'AdSpend': c0})
+        dec = Decanter(df, 'Date', 'Sales', 'AdSpend')
+
+        # Fit
+        h_params = {'h_time': 5, 'h_cov': 2, 'h_season': 0.5}
+        dec.decant_series(h_params, use_grid=True)
+
+        # New Data
+        dates_new = pd.date_range(start='2020-03-01', periods=5, freq='D')
+        c0_new = np.array([20.0, 30.0, 40.0, 20.0, 30.0])
+        df_new = pd.DataFrame({'Date': dates_new, 'AdSpend': c0_new})
+
+        preds = dec.predict(df_new)
+
+        self.assertIn('estimated', preds.columns)
+        self.assertIn('decanted', preds.columns)
+        self.assertEqual(len(preds), 5)
+
+        # Check values
+        # Estimated should be close to 2 * AdSpend
+        # Log space error ~ 0.1?
+        est = preds['estimated'].values
+        expected = c0_new * 2.0
+
+        # Fit might not be perfect with 50 points, but let's check basic range
+        mape = np.mean(np.abs(est - expected) / expected)
+        self.assertLess(mape, 0.2) # Allow 20% error
+
+        # Decanted should be roughly constant (normalized for AdSpend)
+        # Expected value over history of AdSpend (~30) -> Sales ~60
+        dec_vals = preds['decanted'].values
+        self.assertLess(np.std(dec_vals), 5.0) # Should be low variance
 
 if __name__ == '__main__':
     unittest.main()
