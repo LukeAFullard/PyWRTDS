@@ -6,13 +6,14 @@ import itertools
 import pickle
 
 class Decanter:
-    def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None):
+    def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None, daily_data=None):
         """
-        data: pandas DataFrame
+        data: pandas DataFrame (Sample Data for Calibration)
         date_col: string name of date column
         response_col: string name of t0 (target)
         covariate_col: string name of c0 (driver)
         extra_covariates: list of dicts, e.g. [{'col': 'Temp', 'log': False}]
+        daily_data: pandas DataFrame (Full Daily Record for Flow Normalization) - Optional but recommended for accurate FN.
         """
         self.orig_date_col = date_col
         self.orig_response_col = response_col
@@ -20,6 +21,34 @@ class Decanter:
         self.extra_cov_config = extra_covariates if extra_covariates else []
 
         self.df = data.copy()
+        self.daily_history = daily_data.copy() if daily_data is not None else None
+
+        if self.daily_history is not None:
+             if self.orig_date_col not in self.daily_history.columns:
+                  raise ValueError(f"Daily data must contain date column '{self.orig_date_col}'")
+             if self.orig_covariate_col not in self.daily_history.columns:
+                  raise ValueError(f"Daily data must contain covariate column '{self.orig_covariate_col}'")
+
+             # Process daily history
+             self.daily_history['date'] = pd.to_datetime(self.daily_history[self.orig_date_col])
+             if (self.daily_history[self.orig_covariate_col] <= 0).any():
+                  raise ValueError("Daily history contains non-positive covariate values.")
+             self.daily_history['log_covariate'] = np.log(self.daily_history[self.orig_covariate_col])
+
+             # Extra covariates in daily history
+             if self.extra_cov_config:
+                 for conf in self.extra_cov_config:
+                     col = conf['col']
+                     if col not in self.daily_history.columns:
+                         raise ValueError(f"Daily history missing extra covariate '{col}'")
+
+                     is_log = conf.get('log', False)
+                     if is_log:
+                         if (self.daily_history[col] <= 0).any():
+                             raise ValueError(f"Daily history extra covariate '{col}' contains non-positive values.")
+                         self.daily_history[f"log_{col}"] = np.log(self.daily_history[col])
+                     else:
+                         self.daily_history[f"lin_{col}"] = self.daily_history[col]
 
         # Convert dates to Decimal Time (e.g., 2023.5)
         # This simplifies the math for 't'
@@ -100,6 +129,23 @@ class Decanter:
         h_cov = h_params.get('h_cov', 2)
         h_season = h_params.get('h_season', 0.5)
 
+        # Edge Adjustment for Time Window (EGRET style)
+        # Check distance to start/end of record
+        # EGRET uses DecLow/DecHigh from Sample or Daily? Usually Daily coverage.
+        # But runSurvReg uses DecLow/DecHigh passed to it.
+        # Let's assume T min/max from the data loaded (calibration data).
+        # Or should it be the full daily record?
+        # Decanter is usually initialized with calibration data (df).
+        # But typically we want the bounds of the valid data.
+        t_min, t_max = np.min(self.T), np.max(self.T)
+
+        dist_to_edge = min(t_target - t_min, t_max - t_target)
+
+        # If we are closer to edge than windowY, expand window to maintain support
+        # logic: if dist < h, new_h = h + (h - dist) = 2h - dist
+        if dist_to_edge < h_time:
+             h_time = 2 * h_time - dist_to_edge
+
         # 1. Time Distance
         dist_t = self.T - t_target
         w_t = self._tricube(dist_t, h_time)
@@ -176,63 +222,116 @@ class Decanter:
 
         try:
             betas, residuals, rank, s = np.linalg.lstsq(X_w, y_w, rcond=None)
-            return betas
+
+            # Calculate standard error of the regression (sigma) for bias correction
+            # residuals from lstsq is sum of squared residuals
+            if residuals.size > 0:
+                sse = residuals[0]
+            else:
+                 # If residuals empty (perfect fit or undetermined), calculate manually
+                 # or return nan if rank issue
+                 sse = np.sum((y_w - X_w @ betas)**2)
+
+            # Degrees of freedom
+            dof = n_active - n_params
+            if dof > 0:
+                sigma = np.sqrt(sse / dof)
+            else:
+                sigma = np.nan
+
+            # Append sigma to betas
+            return np.append(betas, sigma)
+
         except np.linalg.LinAlgError:
             return None
 
     def predict_point(self, t_target, q_target, betas, extras_target=None, return_log=False):
         """
         Predicts value using the locally fitted betas.
+        Betas array is expected to have sigma as the last element.
         """
         if betas is None: return np.nan
 
+        # Extract sigma (last element) and regression betas
+        sigma = betas[-1]
+        reg_betas = betas[:-1]
+
         # prediction_log = beta0 + beta1*q + beta2*t + beta3*sin + beta4*cos
         # Note: sin/cos depend on t_target, not q_target
-        prediction_log = (betas[0] +
-                          betas[1] * q_target +
-                          betas[2] * t_target +
-                          betas[3] * np.sin(2*np.pi*t_target) +
-                          betas[4] * np.cos(2*np.pi*t_target))
+        prediction_log = (reg_betas[0] +
+                          reg_betas[1] * q_target +
+                          reg_betas[2] * t_target +
+                          reg_betas[3] * np.sin(2*np.pi*t_target) +
+                          reg_betas[4] * np.cos(2*np.pi*t_target))
 
         # Add contributions from extra covariates
         # extras_target: [val1, val2...]
         if extras_target is not None:
             # Betas for extras start at index 5
             for i, val in enumerate(extras_target):
-                prediction_log += betas[5 + i] * val
+                prediction_log += reg_betas[5 + i] * val
 
         if return_log:
             return prediction_log
-        return np.exp(prediction_log) # Return to linear space
 
-    def compute_grid(self, h_params, n_t=100, n_q=15, n_extra=7):
+        # Apply Bias Correction for linear space
+        # exp(y + sigma^2/2)
+        if not np.isnan(sigma):
+             bias = np.exp(sigma**2 / 2)
+        else:
+             bias = 1.0
+
+        return np.exp(prediction_log) * bias
+
+    def compute_grid(self, h_params, n_t=None, n_q=None, n_extra=7):
         """
         Computes the regression surfaces (betas) on a regular grid.
         Returns a tuple of (grid_axes_tuple, betas_grid)
 
+        Defaults match EGRET logic if n_t/n_q are None.
         grid_axes_tuple: (t_grid, q_grid, extra1_grid, ...)
         betas_grid: N-D array of coefficients
         """
         n_extras = self.X_extras.shape[1] if self.X_extras is not None else 0
-        grid_dims_str = f"{n_t} x {n_q}"
-        if n_extras > 0:
-            grid_dims_str += f" x {n_extra}" * n_extras
-
-        print(f"Computing Grid ({grid_dims_str})...")
 
         # 1. Define grid boundaries for Time and Primary Covariate
         t_min, t_max = self.T.min(), self.T.max()
         q_min, q_max = self.Q.min(), self.Q.max()
 
-        if t_min == t_max:
-            t_min -= 0.01
-            t_max += 0.01
-        if q_min == q_max:
-            q_min -= 0.01
-            q_max += 0.01
+        # EGRET Logic for Grid Generation
+        # LogQ: 14 points, min-0.05 to max+0.05
+        # Time: 16 steps per year.
 
-        t_grid = np.linspace(t_min, t_max, n_t)
-        q_grid = np.linspace(q_min, q_max, n_q)
+        # Q Grid
+        if n_q is None:
+             q_bottom = q_min - 0.05
+             q_top = q_max + 0.05
+             n_q = 14
+             q_grid = np.linspace(q_bottom, q_top, n_q)
+        else:
+            if q_min == q_max:
+                q_min -= 0.01
+                q_max += 0.01
+            q_grid = np.linspace(q_min, q_max, n_q)
+
+        # T Grid
+        if n_t is None:
+            t_bottom = np.floor(t_min)
+            t_top = np.ceil(t_max)
+            step_year = 1/16.0
+            t_grid = np.arange(t_bottom, t_top + step_year/1000, step_year)
+            n_t = len(t_grid)
+        else:
+             if t_min == t_max:
+                t_min -= 0.01
+                t_max += 0.01
+             t_grid = np.linspace(t_min, t_max, n_t)
+
+        grid_dims_str = f"{n_t} x {n_q}"
+        if n_extras > 0:
+            grid_dims_str += f" x {n_extra}" * n_extras
+
+        print(f"Computing Grid ({grid_dims_str})...")
 
         # 2. Define grid boundaries for Extra Covariates
         extra_grids = []
@@ -252,8 +351,8 @@ class Decanter:
         grid_axes = [t_grid, q_grid] + extra_grids
 
         # 4. Prepare Betas Grid
-        # Shape: (n_t, n_q, n_e1, ..., n_params)
-        shape = tuple(len(g) for g in grid_axes) + (5 + n_extras,)
+        # Shape: (n_t, n_q, n_e1, ..., n_params + 1) -> +1 for sigma
+        shape = tuple(len(g) for g in grid_axes) + (5 + n_extras + 1,)
         betas_grid = np.zeros(shape)
 
         # 5. Iterate over all grid points
@@ -361,7 +460,7 @@ class Decanter:
         # Rebuild interpolators
         self._build_interpolators_from_grid()
 
-    def get_estimated_series(self, h_params, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
+    def get_estimated_series(self, h_params, use_grid=False, grid_config={'n_t':None, 'n_q':None}):
         """
         Returns the model predictions (in log space) for the observed data points.
         This represents the "trend + seasonality + flow effect" component.
@@ -379,10 +478,11 @@ class Decanter:
 
             pts = np.column_stack(cols)
 
-            # Predict all betas at once: (N, n_betas)
+            # Predict all betas at once: (N, n_betas + 1)
             # List comprehension over interpolators
             betas_cols = [interp(pts) for interp in self.interpolators]
-            all_betas = np.column_stack(betas_cols)
+            all_params = np.column_stack(betas_cols)
+            all_betas = all_params[:, :-1]
 
             # Calculate predictions vectorized
             # beta0 + beta1*Q + beta2*t + beta3*sin + beta4*cos
@@ -422,7 +522,7 @@ class Decanter:
 
             return np.array(preds_log)
 
-    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':100, 'n_q':15}, gfn_window=None, integration_scenarios=None):
+    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':None, 'n_q':None}, gfn_window=None, integration_scenarios=None):
         """
         Generates the cleaned time series t1 (Flow Normalized).
         """
@@ -464,8 +564,18 @@ class Decanter:
                     cols.append(self.X_extras[:, k])
             pts = np.column_stack(cols)
 
-            # (N_samples, N_betas)
-            all_betas = np.column_stack([interp(pts) for interp in self.interpolators])
+            # (N_samples, N_betas + 1)
+            all_params = np.column_stack([interp(pts) for interp in self.interpolators])
+
+            # Split betas and sigma
+            all_betas = all_params[:, :-1]
+            all_sigmas = all_params[:, -1]
+
+            # Calculate Bias Correction Factor per point
+            # If sigma is nan, bias is 1 (or nan? usually bias correction implies valid model)
+            bias_factors = np.exp(all_sigmas**2 / 2)
+            # Handle potential NaNs if sigma was nan
+            bias_factors = np.nan_to_num(bias_factors, nan=1.0)
 
             # 2. Vectorized Integration
             # Formula: beta0 + beta1*Q_hist + beta2*t + ...
@@ -477,42 +587,116 @@ class Decanter:
                           all_betas[:, 4] * np.cos(2*np.pi*self.T))
 
             # Identify Integration Source (Q_integration)
-            # Three cases: Stationary, Scenarios, GFN
+            # Three cases: Stationary (Day-of-Year Specific), Scenarios, GFN
 
-            # Case A: Scenarios or Stationary (Constant Integration Vector)
+            # Case A: Scenarios or Stationary
             if gfn_window is None:
                 if integration_scenarios is not None:
+                    # If scenarios provided, integrate over scenarios (Stationary assumption over scenarios?)
+                    # Usually scenarios provide Q for specific dates?
+                    # If scenario is a single vector (distribution), we use it for all T.
                     Q_integ = Q_scenario
                     Extras_integ = Extras_scenario
+
+                    term_cov = all_betas[:, 1][:, np.newaxis] * Q_integ[np.newaxis, :]
+                    term_extras = 0
+                    if Extras_integ is not None:
+                        for k in range(Extras_integ.shape[1]):
+                            b = all_betas[:, 5 + k][:, np.newaxis]
+                            e = Extras_integ[:, k][np.newaxis, :]
+                            term_extras += b * e
+
+                    log_preds = const_part[:, np.newaxis] + term_cov + term_extras
+                    linear_preds = np.exp(log_preds) * bias_factors[:, np.newaxis]
+                    results = np.nanmean(linear_preds, axis=1)
+                    return results
+
                 else:
-                    Q_integ = self.Q
-                    Extras_integ = self.X_extras
+                    # EGRET Stationary Flow Normalization
+                    # Integrate over historical Qs conditioned on Day of Year.
+                    # Q_integ changes for each row (depends on day of year).
 
-                # Covariate Part: Matrix Multiplication
-                # (N_samples, 1) * (1, N_integration_points) -> (N_samples, N_integration_points)
-                # But to save memory, we can do it row-wise or broadcast if N*M is small.
-                # Let's try broadcasting but be mindful of memory.
+                    # Pre-calculate day of year for historical data
+                    if self.daily_history is not None:
+                        source_df = self.daily_history
+                        doy_hist_vals = source_df['date'].dt.dayofyear.values
+                        source_Q = source_df['log_covariate'].values
+                        if self.X_extras is not None:
+                             extras_cols = [self.daily_history[col].values for col in self.extra_cov_names]
+                             source_Extras = np.column_stack(extras_cols)
+                        else:
+                             source_Extras = None
+                    else:
+                        doy_hist = pd.to_datetime(self.df[self.orig_date_col]).dt.dayofyear
+                        doy_hist_vals = doy_hist.values
+                        source_Q = self.Q
+                        source_Extras = self.X_extras
 
-                # If N*M > 10^8 (e.g. 10k * 10k), we should loop/batch.
-                # Assuming typical use (daily data for 10-20 years ~ 7000 points).
-                # 7000*7000 = 49M doubles = ~400MB. Safe.
+                    # Target days
+                    # self.T corresponds to self.df dates.
+                    doy_target = pd.to_datetime(self.df[self.orig_date_col]).dt.dayofyear.values
 
-                term_cov = all_betas[:, 1][:, np.newaxis] * Q_integ[np.newaxis, :]
+                    # Optimization: Group by DOY
+                    # Unique DOYs (1-366)
+                    # For each unique DOY in target, find matching historical Qs
 
-                term_extras = 0
-                if Extras_integ is not None:
-                    for k in range(Extras_integ.shape[1]):
-                        # beta_ext * Ext_hist
-                        # Beta index is 5 + k
-                        b = all_betas[:, 5 + k][:, np.newaxis]
-                        e = Extras_integ[:, k][np.newaxis, :]
-                        term_extras += b * e
+                    # Create a map of DOY -> Indices in history
+                    # This avoids searching every time
+                    doy_map = {}
+                    for d in range(1, 367):
+                        doy_map[d] = np.where(doy_hist_vals == d)[0]
 
-                log_preds = const_part[:, np.newaxis] + term_cov + term_extras
-                results = np.nanmean(np.exp(log_preds), axis=1)
+                    results = np.full(len(self.df), np.nan)
 
-                # If betas were nan, results are nan.
-                return results
+                    # We can iterate over unique DOYs in target to vectorize chunks
+                    unique_doys = np.unique(doy_target)
+
+                    for d in unique_doys:
+                        target_indices = np.where(doy_target == d)[0]
+                        hist_indices = doy_map[d]
+
+                        if len(hist_indices) == 0:
+                            # Fallback if no history for this day (e.g. leap day?)
+                            # Use +/- 1 day? Or full record?
+                            # EGRET merges 59/60?
+                            # bin_Qs: "59" gets 59+60, "60" gets 59+60 (Feb 28/29)
+                            if d == 60: # Feb 29
+                                hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
+                            elif d == 59:
+                                hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
+                            else:
+                                continue # Should not happen with valid data
+
+                        hist_indices = hist_indices.astype(int)
+
+                        Q_local = source_Q[hist_indices]
+                        Extras_local = source_Extras[hist_indices, :] if source_Extras is not None else None
+
+                        # Calculation for this chunk
+                        # target_indices are the rows in self.df (and all_betas)
+
+                        # betas: (N_chunk, N_params)
+                        chunk_betas = all_betas[target_indices]
+                        chunk_const = const_part[target_indices]
+                        chunk_bias = bias_factors[target_indices]
+
+                        # (N_chunk, 1) * (1, N_hist) -> (N_chunk, N_hist)
+                        term_cov = chunk_betas[:, 1][:, np.newaxis] * Q_local[np.newaxis, :]
+
+                        term_extras = 0
+                        if Extras_local is not None:
+                            for k in range(Extras_local.shape[1]):
+                                b = chunk_betas[:, 5 + k][:, np.newaxis]
+                                e = Extras_local[:, k][np.newaxis, :]
+                                term_extras += b * e
+
+                        log_preds = chunk_const[:, np.newaxis] + term_cov + term_extras
+                        linear_preds = np.exp(log_preds) * chunk_bias[:, np.newaxis]
+
+                        chunk_results = np.nanmean(linear_preds, axis=1)
+                        results[target_indices] = chunk_results
+
+                    return results
 
             else:
                 # Case B: GFN (Windowed) - Integration set changes per row
@@ -548,7 +732,8 @@ class Decanter:
                         for k in range(Extras_local.shape[1]):
                             pred_log += all_betas[i, 5 + k] * Extras_local[:, k]
 
-                    results.append(np.mean(np.exp(pred_log)))
+                    pred_linear = np.exp(pred_log) * bias_factors[i]
+                    results.append(np.mean(pred_linear))
 
                 return np.array(results)
 
@@ -606,8 +791,15 @@ class Decanter:
                         col_vals = Extras_integration[:, k]
                         extra_part += beta_val * col_vals
 
+                # Bias correction
+                sigma = betas[-1]
+                if not np.isnan(sigma):
+                     bias = np.exp(sigma**2 / 2)
+                else:
+                     bias = 1.0
+
                 predictions_log = const_part + cov_part + extra_part
-                predictions = np.exp(predictions_log)
+                predictions = np.exp(predictions_log) * bias
                 t1_val = np.mean(predictions)
                 results.append(t1_val)
 
@@ -633,8 +825,9 @@ class Decanter:
                 raise ValueError(f"New data missing column: {c}")
 
         # Transform
-        df_new['date'] = pd.to_datetime(df_new[self.orig_date_col])
-        df_new['decimal_time'] = df_new['date'].dt.year + (df_new['date'].dt.dayofyear - 1) / 365.25
+        # Use a temporary standard column for processing, but rely on orig_date_col for logic
+        df_new['_date_processed'] = pd.to_datetime(df_new[self.orig_date_col])
+        df_new['decimal_time'] = df_new['_date_processed'].dt.year + (df_new['_date_processed'].dt.dayofyear - 1) / 365.25
 
         if (df_new[self.orig_covariate_col] <= 0).any():
              raise ValueError("New data contains non-positive covariate values.")
@@ -669,8 +862,13 @@ class Decanter:
                     cols.append(X_extras_new[:, k])
             pts = np.column_stack(cols)
 
-            # (N_new, N_betas)
-            all_betas = np.column_stack([interp(pts) for interp in self.interpolators])
+            # (N_new, N_betas + 1)
+            all_params = np.column_stack([interp(pts) for interp in self.interpolators])
+            all_betas = all_params[:, :-1]
+            all_sigmas = all_params[:, -1]
+
+            bias_factors = np.exp(all_sigmas**2 / 2)
+            bias_factors = np.nan_to_num(bias_factors, nan=1.0)
 
             # 2. Estimated Series (Point prediction)
             est_log = (all_betas[:, 0] +
@@ -683,29 +881,85 @@ class Decanter:
                 for k in range(X_extras_new.shape[1]):
                     est_log += all_betas[:, 5 + k] * X_extras_new[:, k]
 
-            estimated = np.exp(est_log)
+            estimated = np.exp(est_log) * bias_factors
 
             # 3. Decanted Series (Stationary Normalization)
-            # Integrate over HISTORICAL Q (self.Q), not new data Q.
-            # Assuming Stationary Flow Normalization.
+            # Integrate over HISTORICAL Q (self.Q) conditioned on Day of Year.
 
             const_part = (all_betas[:, 0] +
                           all_betas[:, 2] * T_new +
                           all_betas[:, 3] * np.sin(2*np.pi*T_new) +
                           all_betas[:, 4] * np.cos(2*np.pi*T_new))
 
-            # Broadcasting: (N_new, 1) + (N_new, 1) * (1, M_hist) ...
-            term_cov = all_betas[:, 1][:, np.newaxis] * self.Q[np.newaxis, :]
+            # Need DOY for new data
+            doy_new = df_new['_date_processed'].dt.dayofyear.values
 
-            term_extras = 0
-            if self.X_extras is not None:
-                for k in range(self.X_extras.shape[1]):
-                    b = all_betas[:, 5 + k][:, np.newaxis]
-                    e = self.X_extras[:, k][np.newaxis, :]
-                    term_extras += b * e
+            # Need DOY for history
+            # Use daily_history if available, otherwise fallback to self.df (Sample) with warning
+            if self.daily_history is not None:
+                source_df = self.daily_history
+                # daily_history has 'date' column created in __init__
+                doy_hist = source_df['date'].dt.dayofyear.values
+                source_Q = source_df['log_covariate'].values
+                if self.X_extras is not None:
+                     # We need to access X_extras from daily_history
+                     # We didn't store X_extras as a matrix in __init__ for daily_history,
+                     # but we added columns. Reconstruct matrix.
+                     extras_cols = [self.daily_history[col].values for col in self.extra_cov_names]
+                     source_Extras = np.column_stack(extras_cols)
+                else:
+                     source_Extras = None
+            else:
+                # Fallback to self.Q (Sample data) - Incorrect for FN but prevents crash if no daily data
+                # print("Warning: No daily history provided. Flow Normalization using sample data (sparse). Results will be inaccurate.")
+                source_df = self.df
+                doy_hist = source_df['date'].dt.dayofyear.values
+                source_Q = self.Q
+                source_Extras = self.X_extras
 
-            log_preds = const_part[:, np.newaxis] + term_cov + term_extras
-            decanted = np.nanmean(np.exp(log_preds), axis=1)
+            # Map DOY -> Hist Indices
+            doy_map = {}
+            for d in range(1, 367):
+                doy_map[d] = np.where(doy_hist == d)[0]
+
+            decanted = np.full(len(df_new), np.nan)
+
+            unique_doys = np.unique(doy_new)
+
+            for d in unique_doys:
+                target_indices = np.where(doy_new == d)[0]
+                hist_indices = doy_map.get(d, np.array([]))
+
+                # Feb 29 logic match
+                if d == 60 or d == 59:
+                     hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
+
+                if len(hist_indices) == 0:
+                    continue
+
+                hist_indices = hist_indices.astype(int)
+
+                Q_local = source_Q[hist_indices]
+                Extras_local = source_Extras[hist_indices, :] if source_Extras is not None else None
+
+                chunk_betas = all_betas[target_indices]
+                chunk_const = const_part[target_indices]
+                chunk_bias = bias_factors[target_indices]
+
+                term_cov = chunk_betas[:, 1][:, np.newaxis] * Q_local[np.newaxis, :]
+
+                term_extras = 0
+                if Extras_local is not None:
+                    for k in range(Extras_local.shape[1]):
+                        b = chunk_betas[:, 5 + k][:, np.newaxis]
+                        e = Extras_local[:, k][np.newaxis, :]
+                        term_extras += b * e
+
+                log_preds = chunk_const[:, np.newaxis] + term_cov + term_extras
+                linear_preds = np.exp(log_preds) * chunk_bias[:, np.newaxis]
+
+                chunk_results = np.nanmean(linear_preds, axis=1)
+                decanted[target_indices] = chunk_results
 
             return pd.DataFrame({'estimated': estimated, 'decanted': decanted}, index=df_new.index)
 
@@ -779,7 +1033,7 @@ class Decanter:
 
         return df_results
 
-    def add_kalman_correction(self, estimated_log_series=None, h_params=None, rho=0.9, use_grid=False, grid_config={'n_t':100, 'n_q':15}):
+    def add_kalman_correction(self, estimated_log_series=None, h_params=None, rho=0.9, use_grid=False, grid_config={'n_t':None, 'n_q':None}):
         """
         Applies WRTDS-Kalman correction (AR1 filtering of residuals).
 
