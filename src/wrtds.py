@@ -176,34 +176,66 @@ class Decanter:
 
         try:
             betas, residuals, rank, s = np.linalg.lstsq(X_w, y_w, rcond=None)
-            return betas
+
+            # Calculate standard error of the regression (sigma) for bias correction
+            # residuals from lstsq is sum of squared residuals
+            if residuals.size > 0:
+                sse = residuals[0]
+            else:
+                 # If residuals empty (perfect fit or undetermined), calculate manually
+                 # or return nan if rank issue
+                 sse = np.sum((y_w - X_w @ betas)**2)
+
+            # Degrees of freedom
+            dof = n_active - n_params
+            if dof > 0:
+                sigma = np.sqrt(sse / dof)
+            else:
+                sigma = np.nan
+
+            # Append sigma to betas
+            return np.append(betas, sigma)
+
         except np.linalg.LinAlgError:
             return None
 
     def predict_point(self, t_target, q_target, betas, extras_target=None, return_log=False):
         """
         Predicts value using the locally fitted betas.
+        Betas array is expected to have sigma as the last element.
         """
         if betas is None: return np.nan
 
+        # Extract sigma (last element) and regression betas
+        sigma = betas[-1]
+        reg_betas = betas[:-1]
+
         # prediction_log = beta0 + beta1*q + beta2*t + beta3*sin + beta4*cos
         # Note: sin/cos depend on t_target, not q_target
-        prediction_log = (betas[0] +
-                          betas[1] * q_target +
-                          betas[2] * t_target +
-                          betas[3] * np.sin(2*np.pi*t_target) +
-                          betas[4] * np.cos(2*np.pi*t_target))
+        prediction_log = (reg_betas[0] +
+                          reg_betas[1] * q_target +
+                          reg_betas[2] * t_target +
+                          reg_betas[3] * np.sin(2*np.pi*t_target) +
+                          reg_betas[4] * np.cos(2*np.pi*t_target))
 
         # Add contributions from extra covariates
         # extras_target: [val1, val2...]
         if extras_target is not None:
             # Betas for extras start at index 5
             for i, val in enumerate(extras_target):
-                prediction_log += betas[5 + i] * val
+                prediction_log += reg_betas[5 + i] * val
 
         if return_log:
             return prediction_log
-        return np.exp(prediction_log) # Return to linear space
+
+        # Apply Bias Correction for linear space
+        # exp(y + sigma^2/2)
+        if not np.isnan(sigma):
+             bias = np.exp(sigma**2 / 2)
+        else:
+             bias = 1.0
+
+        return np.exp(prediction_log) * bias
 
     def compute_grid(self, h_params, n_t=100, n_q=15, n_extra=7):
         """
@@ -252,8 +284,8 @@ class Decanter:
         grid_axes = [t_grid, q_grid] + extra_grids
 
         # 4. Prepare Betas Grid
-        # Shape: (n_t, n_q, n_e1, ..., n_params)
-        shape = tuple(len(g) for g in grid_axes) + (5 + n_extras,)
+        # Shape: (n_t, n_q, n_e1, ..., n_params + 1) -> +1 for sigma
+        shape = tuple(len(g) for g in grid_axes) + (5 + n_extras + 1,)
         betas_grid = np.zeros(shape)
 
         # 5. Iterate over all grid points
@@ -379,10 +411,11 @@ class Decanter:
 
             pts = np.column_stack(cols)
 
-            # Predict all betas at once: (N, n_betas)
+            # Predict all betas at once: (N, n_betas + 1)
             # List comprehension over interpolators
             betas_cols = [interp(pts) for interp in self.interpolators]
-            all_betas = np.column_stack(betas_cols)
+            all_params = np.column_stack(betas_cols)
+            all_betas = all_params[:, :-1]
 
             # Calculate predictions vectorized
             # beta0 + beta1*Q + beta2*t + beta3*sin + beta4*cos
@@ -464,8 +497,18 @@ class Decanter:
                     cols.append(self.X_extras[:, k])
             pts = np.column_stack(cols)
 
-            # (N_samples, N_betas)
-            all_betas = np.column_stack([interp(pts) for interp in self.interpolators])
+            # (N_samples, N_betas + 1)
+            all_params = np.column_stack([interp(pts) for interp in self.interpolators])
+
+            # Split betas and sigma
+            all_betas = all_params[:, :-1]
+            all_sigmas = all_params[:, -1]
+
+            # Calculate Bias Correction Factor per point
+            # If sigma is nan, bias is 1 (or nan? usually bias correction implies valid model)
+            bias_factors = np.exp(all_sigmas**2 / 2)
+            # Handle potential NaNs if sigma was nan
+            bias_factors = np.nan_to_num(bias_factors, nan=1.0)
 
             # 2. Vectorized Integration
             # Formula: beta0 + beta1*Q_hist + beta2*t + ...
@@ -509,7 +552,14 @@ class Decanter:
                         term_extras += b * e
 
                 log_preds = const_part[:, np.newaxis] + term_cov + term_extras
-                results = np.nanmean(np.exp(log_preds), axis=1)
+
+                # Apply bias correction (broadcasted)
+                # bias_factors is (N_samples,)
+                # log_preds is (N_samples, N_integration)
+
+                linear_preds = np.exp(log_preds) * bias_factors[:, np.newaxis]
+
+                results = np.nanmean(linear_preds, axis=1)
 
                 # If betas were nan, results are nan.
                 return results
@@ -548,7 +598,8 @@ class Decanter:
                         for k in range(Extras_local.shape[1]):
                             pred_log += all_betas[i, 5 + k] * Extras_local[:, k]
 
-                    results.append(np.mean(np.exp(pred_log)))
+                    pred_linear = np.exp(pred_log) * bias_factors[i]
+                    results.append(np.mean(pred_linear))
 
                 return np.array(results)
 
@@ -606,8 +657,15 @@ class Decanter:
                         col_vals = Extras_integration[:, k]
                         extra_part += beta_val * col_vals
 
+                # Bias correction
+                sigma = betas[-1]
+                if not np.isnan(sigma):
+                     bias = np.exp(sigma**2 / 2)
+                else:
+                     bias = 1.0
+
                 predictions_log = const_part + cov_part + extra_part
-                predictions = np.exp(predictions_log)
+                predictions = np.exp(predictions_log) * bias
                 t1_val = np.mean(predictions)
                 results.append(t1_val)
 
@@ -669,8 +727,13 @@ class Decanter:
                     cols.append(X_extras_new[:, k])
             pts = np.column_stack(cols)
 
-            # (N_new, N_betas)
-            all_betas = np.column_stack([interp(pts) for interp in self.interpolators])
+            # (N_new, N_betas + 1)
+            all_params = np.column_stack([interp(pts) for interp in self.interpolators])
+            all_betas = all_params[:, :-1]
+            all_sigmas = all_params[:, -1]
+
+            bias_factors = np.exp(all_sigmas**2 / 2)
+            bias_factors = np.nan_to_num(bias_factors, nan=1.0)
 
             # 2. Estimated Series (Point prediction)
             est_log = (all_betas[:, 0] +
@@ -683,7 +746,7 @@ class Decanter:
                 for k in range(X_extras_new.shape[1]):
                     est_log += all_betas[:, 5 + k] * X_extras_new[:, k]
 
-            estimated = np.exp(est_log)
+            estimated = np.exp(est_log) * bias_factors
 
             # 3. Decanted Series (Stationary Normalization)
             # Integrate over HISTORICAL Q (self.Q), not new data Q.
@@ -705,7 +768,7 @@ class Decanter:
                     term_extras += b * e
 
             log_preds = const_part[:, np.newaxis] + term_cov + term_extras
-            decanted = np.nanmean(np.exp(log_preds), axis=1)
+            decanted = np.nanmean(np.exp(log_preds) * bias_factors[:, np.newaxis], axis=1)
 
             return pd.DataFrame({'estimated': estimated, 'decanted': decanted}, index=df_new.index)
 
