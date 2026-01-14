@@ -5,6 +5,18 @@ from scipy.interpolate import RegularGridInterpolator
 import itertools
 import pickle
 
+def to_decimal_date(date_series):
+    """
+    Converts pandas datetime series to decimal year, respecting leap years.
+    Matches EGRET/lubridate: year + (doy - 1) / days_in_year
+    """
+    dt = pd.to_datetime(date_series)
+    year = dt.dt.year
+    doy = dt.dt.dayofyear
+    is_leap = dt.dt.is_leap_year
+    days_in_year = np.where(is_leap, 366, 365)
+    return year + (doy - 1) / days_in_year
+
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None, daily_data=None):
         """
@@ -31,6 +43,9 @@ class Decanter:
 
              # Process daily history
              self.daily_history['date'] = pd.to_datetime(self.daily_history[self.orig_date_col])
+             # Use new decimal date logic
+             self.daily_history['decimal_time'] = to_decimal_date(self.daily_history['date'])
+
              if (self.daily_history[self.orig_covariate_col] <= 0).any():
                   raise ValueError("Daily history contains non-positive covariate values.")
              self.daily_history['log_covariate'] = np.log(self.daily_history[self.orig_covariate_col])
@@ -53,7 +68,7 @@ class Decanter:
         # Convert dates to Decimal Time (e.g., 2023.5)
         # This simplifies the math for 't'
         self.df['date'] = pd.to_datetime(self.df[date_col])
-        self.df['decimal_time'] = self.df['date'].dt.year + (self.df['date'].dt.dayofyear - 1) / 365.25
+        self.df['decimal_time'] = to_decimal_date(self.df['date'])
         self.df['season'] = self.df['decimal_time'] % 1  # 0 to 1
 
         # Transform strictly positive data to Log Space as per WRTDS standard
@@ -99,6 +114,7 @@ class Decanter:
         self.grid_axes = None
         self.betas_grid = None
         self.interpolators = None
+        self.conc_interpolator = None # For surface interpolation
         self.h_params_last = None
 
     def _tricube(self, d, h):
@@ -251,6 +267,14 @@ class Decanter:
 
         # Proceed with WLS
         weights_active = W[mask]
+
+        # Normalize weights to sum to N (approx), matching EGRET logic
+        # EGRET: weight <- weight / mean(weight). sum(weight) = numPosWt.
+        # This affects the magnitude of residuals and thus Sigma.
+        mean_w = np.mean(weights_active)
+        if mean_w > 0:
+            weights_active = weights_active / mean_w
+
         y_active = self.Y[mask]
 
         # Dimension of model: 5 (Standard) + N_extras
@@ -283,7 +307,7 @@ class Decanter:
             betas, residuals, rank, s = np.linalg.lstsq(X_w, y_w, rcond=None)
 
             # Calculate standard error of the regression (sigma) for bias correction
-            # residuals from lstsq is sum of squared residuals
+            # residuals from lstsq is sum of squared residuals (weighted SSE)
             if residuals.size > 0:
                 sse = residuals[0]
             else:
@@ -292,7 +316,9 @@ class Decanter:
                  sse = np.sum((y_w - X_w @ betas)**2)
 
             # Degrees of freedom
-            dof = n_active - n_params
+            # EGRET uses survreg which performs MLE, using N instead of N-p for variance.
+            # To match EGRET exactly, we use dof = n_active.
+            dof = n_active
             if dof > 0:
                 sigma = np.sqrt(sse / dof)
             else:
@@ -462,6 +488,7 @@ class Decanter:
     def _build_interpolators_from_grid(self):
         """
         Reconstructs interpolators from self.grid_axes and self.betas_grid.
+        Also builds Concentration Surface interpolator.
         """
         if self.grid_axes is None or self.betas_grid is None:
             return
@@ -472,13 +499,58 @@ class Decanter:
         for k in range(n_params_grid):
             grid_slice = self.betas_grid[..., k]
 
-            # Legacy 2D filling
-            if len(self.grid_axes) == 2:
-                grid_slice_df = pd.DataFrame(grid_slice)
-                grid_slice = grid_slice_df.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1).values
+            # Legacy 2D filling (if needed, but usually grid is complete or has NaNs)
+            # RegularGridInterpolator handles NaNs with fill_value=nan? No, it propagates NaNs.
+            # EGRET fills holes? We assume compute_grid returns full grid (maybe with NaNs).
 
             interp = RegularGridInterpolator(self.grid_axes, grid_slice, bounds_error=False, fill_value=None)
             self.interpolators.append(interp)
+
+        # Build Concentration Surface Grid
+        # Evaluate model at every grid point
+        # Grid axes: (T, Q, E...)
+        # We need to construct meshgrid logic to evaluate the polynomial
+
+        # Helper to generate meshgrid points
+        # meshgrid with indexing='ij' matches array layout
+        grids = np.meshgrid(*self.grid_axes, indexing='ij')
+
+        # Extract components
+        T_grid = grids[0]
+        Q_grid = grids[1]
+
+        # Betas slices
+        # betas_grid shape: (N_T, N_Q, ..., N_Params)
+        beta0 = self.betas_grid[..., 0]
+        beta1 = self.betas_grid[..., 1]
+        beta2 = self.betas_grid[..., 2]
+        beta3 = self.betas_grid[..., 3]
+        beta4 = self.betas_grid[..., 4]
+        sigma = self.betas_grid[..., -1]
+
+        yHat_grid = (beta0 +
+                     beta1 * Q_grid +
+                     beta2 * T_grid +
+                     beta3 * np.sin(2 * np.pi * T_grid) +
+                     beta4 * np.cos(2 * np.pi * T_grid))
+
+        # Extras
+        n_extras = len(self.extra_cov_config)
+        if n_extras > 0:
+            for k in range(n_extras):
+                E_grid = grids[2 + k]
+                beta_k = self.betas_grid[..., 5 + k]
+                yHat_grid += beta_k * E_grid
+
+        # Bias Correction
+        bias_grid = np.exp(sigma**2 / 2)
+        # Handle NaNs in sigma (bias=1)
+        bias_grid = np.nan_to_num(bias_grid, nan=1.0)
+
+        # Concentration Grid
+        conc_grid = np.exp(yHat_grid) * bias_grid
+
+        self.conc_interpolator = RegularGridInterpolator(self.grid_axes, conc_grid, bounds_error=False, fill_value=None)
 
     def save_model(self, filepath):
         """
@@ -590,9 +662,10 @@ class Decanter:
 
             return np.array(preds_log)
 
-    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':None, 'n_q':None}, gfn_window=None, integration_scenarios=None, min_obs=100):
+    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':None, 'n_q':None}, gfn_window=None, integration_scenarios=None, min_obs=100, interp_method='surface'):
         """
         Generates the cleaned time series t1 (Flow Normalized).
+        interp_method: 'surface' (EGRET style, interpolate Conc) or 'coefficients' (interpolate betas).
         """
         # Pre-process integration scenarios
         Q_scenario = None
@@ -629,34 +702,37 @@ class Decanter:
             if self.interpolators is None:
                 self._prepare_grid_interpolators(h_params, gc)
 
-            # 1. Vectorized Beta Interpolation
-            cols = [self.T, self.Q]
-            if self.X_extras is not None:
-                for k in range(self.X_extras.shape[1]):
-                    cols.append(self.X_extras[:, k])
-            pts = np.column_stack(cols)
+            # Pre-calculation for Coefficient Method
+            all_betas = None
+            bias_factors = None
+            const_part = None
 
-            # (N_samples, N_betas + 1)
-            all_params = np.column_stack([interp(pts) for interp in self.interpolators])
+            if interp_method == 'coefficients' or (integration_scenarios is not None):
+                # Fallback to coefficients for scenarios if surface not implemented for scenarios yet
+                # Or simply always compute betas if we might need them.
+                # 1. Vectorized Beta Interpolation
+                cols = [self.T, self.Q]
+                if self.X_extras is not None:
+                    for k in range(self.X_extras.shape[1]):
+                        cols.append(self.X_extras[:, k])
+                pts = np.column_stack(cols)
 
-            # Split betas and sigma
-            all_betas = all_params[:, :-1]
-            all_sigmas = all_params[:, -1]
+                # (N_samples, N_betas + 1)
+                all_params = np.column_stack([interp(pts) for interp in self.interpolators])
 
-            # Calculate Bias Correction Factor per point
-            # If sigma is nan, bias is 1 (or nan? usually bias correction implies valid model)
-            bias_factors = np.exp(all_sigmas**2 / 2)
-            # Handle potential NaNs if sigma was nan
-            bias_factors = np.nan_to_num(bias_factors, nan=1.0)
+                # Split betas and sigma
+                all_betas = all_params[:, :-1]
+                all_sigmas = all_params[:, -1]
 
-            # 2. Vectorized Integration
-            # Formula: beta0 + beta1*Q_hist + beta2*t + ...
+                # Calculate Bias Correction Factor per point
+                bias_factors = np.exp(all_sigmas**2 / 2)
+                bias_factors = np.nan_to_num(bias_factors, nan=1.0)
 
-            # Constant part per time step
-            const_part = (all_betas[:, 0] +
-                          all_betas[:, 2] * self.T +
-                          all_betas[:, 3] * np.sin(2*np.pi*self.T) +
-                          all_betas[:, 4] * np.cos(2*np.pi*self.T))
+                # Constant part per time step
+                const_part = (all_betas[:, 0] +
+                              all_betas[:, 2] * self.T +
+                              all_betas[:, 3] * np.sin(2*np.pi*self.T) +
+                              all_betas[:, 4] * np.cos(2*np.pi*self.T))
 
             # Identify Integration Source (Q_integration)
             # Three cases: Stationary (Day-of-Year Specific), Scenarios, GFN
@@ -745,28 +821,62 @@ class Decanter:
                         Extras_local = source_Extras[hist_indices, :] if source_Extras is not None else None
 
                         # Calculation for this chunk
-                        # target_indices are the rows in self.df (and all_betas)
+                        # target_indices are the rows in self.df
+                        n_chunk = len(target_indices)
+                        n_hist = len(hist_indices)
 
-                        # betas: (N_chunk, N_params)
-                        chunk_betas = all_betas[target_indices]
-                        chunk_const = const_part[target_indices]
-                        chunk_bias = bias_factors[target_indices]
+                        if interp_method == 'coefficients':
+                            # betas: (N_chunk, N_params)
+                            chunk_betas = all_betas[target_indices]
+                            chunk_const = const_part[target_indices]
+                            chunk_bias = bias_factors[target_indices]
 
-                        # (N_chunk, 1) * (1, N_hist) -> (N_chunk, N_hist)
-                        term_cov = chunk_betas[:, 1][:, np.newaxis] * Q_local[np.newaxis, :]
+                            # (N_chunk, 1) * (1, N_hist) -> (N_chunk, N_hist)
+                            term_cov = chunk_betas[:, 1][:, np.newaxis] * Q_local[np.newaxis, :]
 
-                        term_extras = 0
-                        if Extras_local is not None:
-                            for k in range(Extras_local.shape[1]):
-                                b = chunk_betas[:, 5 + k][:, np.newaxis]
-                                e = Extras_local[:, k][np.newaxis, :]
-                                term_extras += b * e
+                            term_extras = 0
+                            if Extras_local is not None:
+                                for k in range(Extras_local.shape[1]):
+                                    b = chunk_betas[:, 5 + k][:, np.newaxis]
+                                    e = Extras_local[:, k][np.newaxis, :]
+                                    term_extras += b * e
 
-                        log_preds = chunk_const[:, np.newaxis] + term_cov + term_extras
-                        linear_preds = np.exp(log_preds) * chunk_bias[:, np.newaxis]
+                            log_preds = chunk_const[:, np.newaxis] + term_cov + term_extras
+                            linear_preds = np.exp(log_preds) * chunk_bias[:, np.newaxis]
 
-                        chunk_results = np.nanmean(linear_preds, axis=1)
-                        results[target_indices] = chunk_results
+                            chunk_results = np.nanmean(linear_preds, axis=1)
+                            results[target_indices] = chunk_results
+
+                        elif interp_method == 'surface':
+                            # Construct all pairs (T_target, Q_hist)
+                            # T_target: self.T[target_indices]
+                            T_chunk = self.T[target_indices]
+
+                            # Meshgrid logic manual broadcast
+                            # T: (N_chunk, 1) -> (N_chunk, N_hist)
+                            T_eval = np.broadcast_to(T_chunk[:, np.newaxis], (n_chunk, n_hist)).ravel()
+                            # Q: (1, N_hist) -> (N_chunk, N_hist)
+                            Q_eval = np.broadcast_to(Q_local[np.newaxis, :], (n_chunk, n_hist)).ravel()
+
+                            eval_cols = [T_eval, Q_eval]
+                            if Extras_local is not None:
+                                # Extras correspond to Q_hist.
+                                # Extra k: (1, N_hist) -> (N_chunk, N_hist)
+                                for k in range(Extras_local.shape[1]):
+                                    E_k = Extras_local[:, k]
+                                    E_eval = np.broadcast_to(E_k[np.newaxis, :], (n_chunk, n_hist)).ravel()
+                                    eval_cols.append(E_eval)
+
+                            eval_pts = np.column_stack(eval_cols)
+
+                            # Interpolate Conc directly
+                            # returns shape (N_eval,)
+                            conc_vals = self.conc_interpolator(eval_pts)
+
+                            # Reshape to (N_chunk, N_hist) and mean
+                            conc_matrix = conc_vals.reshape(n_chunk, n_hist)
+                            chunk_results = np.nanmean(conc_matrix, axis=1)
+                            results[target_indices] = chunk_results
 
                     return results
 
@@ -877,10 +987,11 @@ class Decanter:
 
             return results
 
-    def predict(self, new_data_df, use_grid=True):
+    def predict(self, new_data_df, use_grid=True, interp_method='surface'):
         """
         Out-of-sample prediction using the fitted model.
         Returns a DataFrame with 'estimated' (point prediction) and 'decanted' (flow normalized) columns.
+        interp_method: 'surface' or 'coefficients'.
         """
         if use_grid and self.interpolators is None:
              raise ValueError("Model grid not found. Run decant_series(use_grid=True) or load_model() first.")
@@ -899,7 +1010,7 @@ class Decanter:
         # Transform
         # Use a temporary standard column for processing, but rely on orig_date_col for logic
         df_new['_date_processed'] = pd.to_datetime(df_new[self.orig_date_col])
-        df_new['decimal_time'] = df_new['_date_processed'].dt.year + (df_new['_date_processed'].dt.dayofyear - 1) / 365.25
+        df_new['decimal_time'] = to_decimal_date(df_new['_date_processed'])
 
         if (df_new[self.orig_covariate_col] <= 0).any():
              raise ValueError("New data contains non-positive covariate values.")
@@ -927,41 +1038,50 @@ class Decanter:
         # Prediction
 
         if use_grid:
-            # 1. Interpolate Betas
-            cols = [T_new, Q_new]
-            if X_extras_new is not None:
-                for k in range(X_extras_new.shape[1]):
-                    cols.append(X_extras_new[:, k])
-            pts = np.column_stack(cols)
+            # 1. Estimated Series (Point prediction)
+            if interp_method == 'coefficients':
+                cols = [T_new, Q_new]
+                if X_extras_new is not None:
+                    for k in range(X_extras_new.shape[1]):
+                        cols.append(X_extras_new[:, k])
+                pts = np.column_stack(cols)
 
-            # (N_new, N_betas + 1)
-            all_params = np.column_stack([interp(pts) for interp in self.interpolators])
-            all_betas = all_params[:, :-1]
-            all_sigmas = all_params[:, -1]
+                all_params = np.column_stack([interp(pts) for interp in self.interpolators])
+                all_betas = all_params[:, :-1]
+                all_sigmas = all_params[:, -1]
 
-            bias_factors = np.exp(all_sigmas**2 / 2)
-            bias_factors = np.nan_to_num(bias_factors, nan=1.0)
+                bias_factors = np.exp(all_sigmas**2 / 2)
+                bias_factors = np.nan_to_num(bias_factors, nan=1.0)
 
-            # 2. Estimated Series (Point prediction)
-            est_log = (all_betas[:, 0] +
-                       all_betas[:, 1] * Q_new +
-                       all_betas[:, 2] * T_new +
-                       all_betas[:, 3] * np.sin(2 * np.pi * T_new) +
-                       all_betas[:, 4] * np.cos(2 * np.pi * T_new))
+                est_log = (all_betas[:, 0] +
+                           all_betas[:, 1] * Q_new +
+                           all_betas[:, 2] * T_new +
+                           all_betas[:, 3] * np.sin(2 * np.pi * T_new) +
+                           all_betas[:, 4] * np.cos(2 * np.pi * T_new))
 
-            if X_extras_new is not None:
-                for k in range(X_extras_new.shape[1]):
-                    est_log += all_betas[:, 5 + k] * X_extras_new[:, k]
+                if X_extras_new is not None:
+                    for k in range(X_extras_new.shape[1]):
+                        est_log += all_betas[:, 5 + k] * X_extras_new[:, k]
 
-            estimated = np.exp(est_log) * bias_factors
+                estimated = np.exp(est_log) * bias_factors
+
+                # Pre-calc for FN
+                const_part = (all_betas[:, 0] +
+                              all_betas[:, 2] * T_new +
+                              all_betas[:, 3] * np.sin(2*np.pi*T_new) +
+                              all_betas[:, 4] * np.cos(2*np.pi*T_new))
+
+            elif interp_method == 'surface':
+                cols = [T_new, Q_new]
+                if X_extras_new is not None:
+                    for k in range(X_extras_new.shape[1]):
+                        cols.append(X_extras_new[:, k])
+                pts = np.column_stack(cols)
+
+                estimated = self.conc_interpolator(pts)
 
             # 3. Decanted Series (Stationary Normalization)
             # Integrate over HISTORICAL Q (self.Q) conditioned on Day of Year.
-
-            const_part = (all_betas[:, 0] +
-                          all_betas[:, 2] * T_new +
-                          all_betas[:, 3] * np.sin(2*np.pi*T_new) +
-                          all_betas[:, 4] * np.cos(2*np.pi*T_new))
 
             # Need DOY for new data
             doy_new = df_new['_date_processed'].dt.dayofyear.values
@@ -1014,24 +1134,47 @@ class Decanter:
                 Q_local = source_Q[hist_indices]
                 Extras_local = source_Extras[hist_indices, :] if source_Extras is not None else None
 
-                chunk_betas = all_betas[target_indices]
-                chunk_const = const_part[target_indices]
-                chunk_bias = bias_factors[target_indices]
+                n_chunk = len(target_indices)
+                n_hist = len(hist_indices)
 
-                term_cov = chunk_betas[:, 1][:, np.newaxis] * Q_local[np.newaxis, :]
+                if interp_method == 'coefficients':
+                    chunk_betas = all_betas[target_indices]
+                    chunk_const = const_part[target_indices]
+                    chunk_bias = bias_factors[target_indices]
 
-                term_extras = 0
-                if Extras_local is not None:
-                    for k in range(Extras_local.shape[1]):
-                        b = chunk_betas[:, 5 + k][:, np.newaxis]
-                        e = Extras_local[:, k][np.newaxis, :]
-                        term_extras += b * e
+                    term_cov = chunk_betas[:, 1][:, np.newaxis] * Q_local[np.newaxis, :]
 
-                log_preds = chunk_const[:, np.newaxis] + term_cov + term_extras
-                linear_preds = np.exp(log_preds) * chunk_bias[:, np.newaxis]
+                    term_extras = 0
+                    if Extras_local is not None:
+                        for k in range(Extras_local.shape[1]):
+                            b = chunk_betas[:, 5 + k][:, np.newaxis]
+                            e = Extras_local[:, k][np.newaxis, :]
+                            term_extras += b * e
 
-                chunk_results = np.nanmean(linear_preds, axis=1)
-                decanted[target_indices] = chunk_results
+                    log_preds = chunk_const[:, np.newaxis] + term_cov + term_extras
+                    linear_preds = np.exp(log_preds) * chunk_bias[:, np.newaxis]
+
+                    chunk_results = np.nanmean(linear_preds, axis=1)
+                    decanted[target_indices] = chunk_results
+
+                elif interp_method == 'surface':
+                    T_chunk = T_new[target_indices]
+
+                    T_eval = np.broadcast_to(T_chunk[:, np.newaxis], (n_chunk, n_hist)).ravel()
+                    Q_eval = np.broadcast_to(Q_local[np.newaxis, :], (n_chunk, n_hist)).ravel()
+
+                    eval_cols = [T_eval, Q_eval]
+                    if Extras_local is not None:
+                        for k in range(Extras_local.shape[1]):
+                            E_k = Extras_local[:, k]
+                            E_eval = np.broadcast_to(E_k[np.newaxis, :], (n_chunk, n_hist)).ravel()
+                            eval_cols.append(E_eval)
+
+                    eval_pts = np.column_stack(eval_cols)
+                    conc_vals = self.conc_interpolator(eval_pts)
+
+                    conc_matrix = conc_vals.reshape(n_chunk, n_hist)
+                    decanted[target_indices] = np.nanmean(conc_matrix, axis=1)
 
             return pd.DataFrame({'estimated': estimated, 'decanted': decanted}, index=df_new.index)
 
