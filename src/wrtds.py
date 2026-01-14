@@ -5,6 +5,18 @@ from scipy.interpolate import RegularGridInterpolator
 import itertools
 import pickle
 
+def to_decimal_date(date_series):
+    """
+    Converts pandas datetime series to decimal year, respecting leap years.
+    Matches EGRET/lubridate: year + (doy - 1) / days_in_year
+    """
+    dt = pd.to_datetime(date_series)
+    year = dt.dt.year
+    doy = dt.dt.dayofyear
+    is_leap = dt.dt.is_leap_year
+    days_in_year = np.where(is_leap, 366, 365)
+    return year + (doy - 1) / days_in_year
+
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None, daily_data=None):
         """
@@ -31,6 +43,9 @@ class Decanter:
 
              # Process daily history
              self.daily_history['date'] = pd.to_datetime(self.daily_history[self.orig_date_col])
+             # Use new decimal date logic
+             self.daily_history['decimal_time'] = to_decimal_date(self.daily_history['date'])
+
              if (self.daily_history[self.orig_covariate_col] <= 0).any():
                   raise ValueError("Daily history contains non-positive covariate values.")
              self.daily_history['log_covariate'] = np.log(self.daily_history[self.orig_covariate_col])
@@ -53,7 +68,7 @@ class Decanter:
         # Convert dates to Decimal Time (e.g., 2023.5)
         # This simplifies the math for 't'
         self.df['date'] = pd.to_datetime(self.df[date_col])
-        self.df['decimal_time'] = self.df['date'].dt.year + (self.df['date'].dt.dayofyear - 1) / 365.25
+        self.df['decimal_time'] = to_decimal_date(self.df['date'])
         self.df['season'] = self.df['decimal_time'] % 1  # 0 to 1
 
         # Transform strictly positive data to Log Space as per WRTDS standard
@@ -251,6 +266,14 @@ class Decanter:
 
         # Proceed with WLS
         weights_active = W[mask]
+
+        # Normalize weights to sum to N (approx), matching EGRET logic
+        # EGRET: weight <- weight / mean(weight). sum(weight) = numPosWt.
+        # This affects the magnitude of residuals and thus Sigma.
+        mean_w = np.mean(weights_active)
+        if mean_w > 0:
+            weights_active = weights_active / mean_w
+
         y_active = self.Y[mask]
 
         # Dimension of model: 5 (Standard) + N_extras
@@ -283,7 +306,7 @@ class Decanter:
             betas, residuals, rank, s = np.linalg.lstsq(X_w, y_w, rcond=None)
 
             # Calculate standard error of the regression (sigma) for bias correction
-            # residuals from lstsq is sum of squared residuals
+            # residuals from lstsq is sum of squared residuals (weighted SSE)
             if residuals.size > 0:
                 sse = residuals[0]
             else:
@@ -899,7 +922,7 @@ class Decanter:
         # Transform
         # Use a temporary standard column for processing, but rely on orig_date_col for logic
         df_new['_date_processed'] = pd.to_datetime(df_new[self.orig_date_col])
-        df_new['decimal_time'] = df_new['_date_processed'].dt.year + (df_new['_date_processed'].dt.dayofyear - 1) / 365.25
+        df_new['decimal_time'] = to_decimal_date(df_new['_date_processed'])
 
         if (df_new[self.orig_covariate_col] <= 0).any():
              raise ValueError("New data contains non-positive covariate values.")
