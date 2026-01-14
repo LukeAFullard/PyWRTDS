@@ -17,6 +17,23 @@ def to_decimal_date(date_series):
     days_in_year = np.where(is_leap, 366, 365)
     return year + (doy - 1) / days_in_year
 
+def get_adjusted_doy(date_series):
+    """
+    Returns day of year (1-366).
+    For non-leap years, days >= 60 (Mar 1+) are shifted by +1.
+    This ensures Mar 1 is always 61, Feb 29 is 60.
+    """
+    dt = pd.to_datetime(date_series)
+    doy = dt.dt.dayofyear
+    is_leap = dt.dt.is_leap_year
+
+    vals = doy.values.copy()
+    # Shift non-leap days after Feb 28 (doy 59)
+    # If not leap, doy 60 is Mar 1. We want it to be 61.
+    mask = (~is_leap.values) & (vals >= 60)
+    vals[mask] += 1
+    return vals
+
 class Decanter:
     def __init__(self, data, date_col, response_col, covariate_col, extra_covariates=None, daily_data=None):
         """
@@ -776,7 +793,7 @@ class Decanter:
                     # Pre-calculate day of year for historical data
                     if self.daily_history is not None:
                         source_df = self.daily_history
-                        doy_hist_vals = source_df['date'].dt.dayofyear.values
+                        doy_hist_vals = get_adjusted_doy(source_df['date'])
                         source_Q = source_df['log_covariate'].values
                         if self.X_extras is not None:
                              extras_cols = [self.daily_history[col].values for col in self.extra_cov_names]
@@ -784,14 +801,12 @@ class Decanter:
                         else:
                              source_Extras = None
                     else:
-                        doy_hist = pd.to_datetime(self.df[self.orig_date_col]).dt.dayofyear
-                        doy_hist_vals = doy_hist.values
+                        doy_hist_vals = get_adjusted_doy(self.df[self.orig_date_col])
                         source_Q = self.Q
                         source_Extras = self.X_extras
 
                     # Target days
-                    # self.T corresponds to self.df dates.
-                    doy_target = pd.to_datetime(self.df[self.orig_date_col]).dt.dayofyear.values
+                    doy_target = get_adjusted_doy(self.df[self.orig_date_col])
 
                     # Optimization: Group by DOY
                     # Unique DOYs (1-366)
@@ -800,7 +815,7 @@ class Decanter:
                     # Create a map of DOY -> Indices in history
                     # This avoids searching every time
                     doy_map = {}
-                    for d in range(1, 367):
+                    for d in range(1, 368):
                         doy_map[d] = np.where(doy_hist_vals == d)[0]
 
                     results = np.full(len(self.df), np.nan)
@@ -810,19 +825,15 @@ class Decanter:
 
                     for d in unique_doys:
                         target_indices = np.where(doy_target == d)[0]
-                        hist_indices = doy_map[d]
+                        hist_indices = doy_map.get(d, np.array([]))
+
+                        # Special handling for Feb 28 (59) and Feb 29 (60)
+                        # Merge them to ensure sufficient data and continuity
+                        if d == 59 or d == 60:
+                            hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
 
                         if len(hist_indices) == 0:
-                            # Fallback if no history for this day (e.g. leap day?)
-                            # Use +/- 1 day? Or full record?
-                            # EGRET merges 59/60?
-                            # bin_Qs: "59" gets 59+60, "60" gets 59+60 (Feb 28/29)
-                            if d == 60: # Feb 29
-                                hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
-                            elif d == 59:
-                                hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
-                            else:
-                                continue # Should not happen with valid data
+                            continue # Should not happen with valid data
 
                         hist_indices = hist_indices.astype(int)
 
@@ -1093,14 +1104,14 @@ class Decanter:
             # Integrate over HISTORICAL Q (self.Q) conditioned on Day of Year.
 
             # Need DOY for new data
-            doy_new = df_new['_date_processed'].dt.dayofyear.values
+            doy_new = get_adjusted_doy(df_new['_date_processed'])
 
             # Need DOY for history
             # Use daily_history if available, otherwise fallback to self.df (Sample) with warning
             if self.daily_history is not None:
                 source_df = self.daily_history
                 # daily_history has 'date' column created in __init__
-                doy_hist = source_df['date'].dt.dayofyear.values
+                doy_hist = get_adjusted_doy(source_df['date'])
                 source_Q = source_df['log_covariate'].values
                 if self.X_extras is not None:
                      # We need to access X_extras from daily_history
@@ -1114,13 +1125,13 @@ class Decanter:
                 # Fallback to self.Q (Sample data) - Incorrect for FN but prevents crash if no daily data
                 # print("Warning: No daily history provided. Flow Normalization using sample data (sparse). Results will be inaccurate.")
                 source_df = self.df
-                doy_hist = source_df['date'].dt.dayofyear.values
+                doy_hist = get_adjusted_doy(source_df['date'])
                 source_Q = self.Q
                 source_Extras = self.X_extras
 
             # Map DOY -> Hist Indices
             doy_map = {}
-            for d in range(1, 367):
+            for d in range(1, 368):
                 doy_map[d] = np.where(doy_hist == d)[0]
 
             decanted = np.full(len(df_new), np.nan)
@@ -1131,8 +1142,8 @@ class Decanter:
                 target_indices = np.where(doy_new == d)[0]
                 hist_indices = doy_map.get(d, np.array([]))
 
-                # Feb 29 logic match
-                if d == 60 or d == 59:
+                # Special handling for Feb 28 (59) and Feb 29 (60)
+                if d == 59 or d == 60:
                      hist_indices = np.concatenate([doy_map.get(59, []), doy_map.get(60, [])])
 
                 if len(hist_indices) == 0:
