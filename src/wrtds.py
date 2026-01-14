@@ -574,9 +574,17 @@ class Decanter:
         bias_grid = np.nan_to_num(bias_grid, nan=1.0)
 
         # Concentration Grid
-        conc_grid = np.exp(yHat_grid) * bias_grid
+        # We store yHat and bias separately to interpolate in log space if needed
+        self.yHat_grid = yHat_grid
+        self.bias_grid = bias_grid
 
+        # Legacy direct concentration interpolator (Default Surface)
+        conc_grid = np.exp(yHat_grid) * bias_grid
         self.conc_interpolator = RegularGridInterpolator(self.grid_axes, conc_grid, bounds_error=False, fill_value=None)
+
+        # New: Log Surface Interpolators
+        self.log_conc_interpolator = RegularGridInterpolator(self.grid_axes, yHat_grid, bounds_error=False, fill_value=None)
+        self.bias_interpolator = RegularGridInterpolator(self.grid_axes, bias_grid, bounds_error=False, fill_value=None)
 
     def save_model(self, filepath):
         """
@@ -691,7 +699,7 @@ class Decanter:
     def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':None, 'n_q':None}, gfn_window=None, integration_scenarios=None, min_obs=100, interp_method='surface'):
         """
         Generates the cleaned time series t1 (Flow Normalized).
-        interp_method: 'surface' (EGRET style, interpolate Conc) or 'coefficients' (interpolate betas).
+        interp_method: 'surface' (interpolate Conc), 'log_surface' (interpolate LogConc then Exp), or 'coefficients'.
         """
         # Pre-process integration scenarios
         Q_scenario = None
@@ -867,7 +875,7 @@ class Decanter:
                             chunk_results = np.nanmean(linear_preds, axis=1)
                             results[target_indices] = chunk_results
 
-                        elif interp_method == 'surface':
+                        elif interp_method == 'surface' or interp_method == 'log_surface':
                             # Construct all pairs (T_target, Q_hist)
                             # T_target: self.T[target_indices]
                             T_chunk = self.T[target_indices]
@@ -889,9 +897,13 @@ class Decanter:
 
                             eval_pts = np.column_stack(eval_cols)
 
-                            # Interpolate Conc directly
-                            # returns shape (N_eval,)
-                            conc_vals = self.conc_interpolator(eval_pts)
+                            if interp_method == 'surface':
+                                # Interpolate Conc directly
+                                conc_vals = self.conc_interpolator(eval_pts)
+                            else: # log_surface
+                                log_vals = self.log_conc_interpolator(eval_pts)
+                                bias_vals = self.bias_interpolator(eval_pts)
+                                conc_vals = np.exp(log_vals) * bias_vals
 
                             # Reshape to (N_chunk, N_hist) and mean
                             conc_matrix = conc_vals.reshape(n_chunk, n_hist)
@@ -1011,7 +1023,7 @@ class Decanter:
         """
         Out-of-sample prediction using the fitted model.
         Returns a DataFrame with 'estimated' (point prediction) and 'decanted' (flow normalized) columns.
-        interp_method: 'surface' or 'coefficients'.
+        interp_method: 'surface', 'log_surface', or 'coefficients'.
         """
         if use_grid and self.interpolators is None:
              raise ValueError("Model grid not found. Run decant_series(use_grid=True) or load_model() first.")
@@ -1091,14 +1103,19 @@ class Decanter:
                               all_betas[:, 3] * np.sin(2*np.pi*T_new) +
                               all_betas[:, 4] * np.cos(2*np.pi*T_new))
 
-            elif interp_method == 'surface':
+            elif interp_method == 'surface' or interp_method == 'log_surface':
                 cols = [T_new, Q_new]
                 if X_extras_new is not None:
                     for k in range(X_extras_new.shape[1]):
                         cols.append(X_extras_new[:, k])
                 pts = np.column_stack(cols)
 
-                estimated = self.conc_interpolator(pts)
+                if interp_method == 'surface':
+                    estimated = self.conc_interpolator(pts)
+                else:
+                    log_est = self.log_conc_interpolator(pts)
+                    bias_est = self.bias_interpolator(pts)
+                    estimated = np.exp(log_est) * bias_est
 
             # 3. Decanted Series (Stationary Normalization)
             # Integrate over HISTORICAL Q (self.Q) conditioned on Day of Year.
@@ -1177,7 +1194,7 @@ class Decanter:
                     chunk_results = np.nanmean(linear_preds, axis=1)
                     decanted[target_indices] = chunk_results
 
-                elif interp_method == 'surface':
+                elif interp_method == 'surface' or interp_method == 'log_surface':
                     T_chunk = T_new[target_indices]
 
                     T_eval = np.broadcast_to(T_chunk[:, np.newaxis], (n_chunk, n_hist)).ravel()
@@ -1191,7 +1208,13 @@ class Decanter:
                             eval_cols.append(E_eval)
 
                     eval_pts = np.column_stack(eval_cols)
-                    conc_vals = self.conc_interpolator(eval_pts)
+
+                    if interp_method == 'surface':
+                        conc_vals = self.conc_interpolator(eval_pts)
+                    else:
+                        log_vals = self.log_conc_interpolator(eval_pts)
+                        bias_vals = self.bias_interpolator(eval_pts)
+                        conc_vals = np.exp(log_vals) * bias_vals
 
                     conc_matrix = conc_vals.reshape(n_chunk, n_hist)
                     decanted[target_indices] = np.nanmean(conc_matrix, axis=1)
