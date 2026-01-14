@@ -117,6 +117,15 @@ class Decanter:
         self.conc_interpolator = None # For surface interpolation
         self.h_params_last = None
 
+        # Determine boundaries for edge adjustment
+        # Use daily history if available (EGRET logic uses Daily range), else Sample range
+        if self.daily_history is not None:
+            self.t_min_bound = np.min(self.daily_history['decimal_time'].values)
+            self.t_max_bound = np.max(self.daily_history['decimal_time'].values)
+        else:
+            self.t_min_bound = np.min(self.T)
+            self.t_max_bound = np.max(self.T)
+
     def _tricube(self, d, h):
         """
         Calculates tricube weight.
@@ -203,7 +212,7 @@ class Decanter:
         # Then loop: tempWindowY *= 1.1
 
         # So I should handle edge adjustment logic here based on current h_time
-        t_min, t_max = np.min(self.T), np.max(self.T)
+        t_min, t_max = self.t_min_bound, self.t_max_bound
         dist_to_edge = min(t_target - t_min, t_max - t_target)
 
         # Initial adjustment
