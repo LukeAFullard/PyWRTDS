@@ -8,13 +8,14 @@ df = pd.read_csv('test_data_sample.csv')
 df_daily = pd.read_csv('test_data_daily.csv')
 
 # 2. Initialize Decanter
-decanter = Decanter(df, date_col='Date', response_col='Conc', covariate_col='Q')
+decanter = Decanter(df, date_col='Date', response_col='Conc', covariate_col='Q', daily_data=df_daily)
 
 # 3. Decant Series
 h_params = {'h_time': 7, 'h_cov': 2, 'h_season': 0.5}
 
 print(f"Running pyWRTDS with default EGRET-style grid...")
-grid_config = {'n_t': None, 'n_q': None} # Trigger EGRET defaults
+# Match EGRET run_egret.R which uses minNumObs=50
+grid_config = {'n_t': None, 'n_q': None, 'min_obs': 50}
 
 # Fit grid
 decanter.decant_series(h_params, use_grid=True, grid_config=grid_config)

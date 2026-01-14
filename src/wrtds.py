@@ -129,22 +129,13 @@ class Decanter:
         h_cov = h_params.get('h_cov', 2)
         h_season = h_params.get('h_season', 0.5)
 
-        # Edge Adjustment for Time Window (EGRET style)
-        # Check distance to start/end of record
-        # EGRET uses DecLow/DecHigh from Sample or Daily? Usually Daily coverage.
-        # But runSurvReg uses DecLow/DecHigh passed to it.
-        # Let's assume T min/max from the data loaded (calibration data).
-        # Or should it be the full daily record?
-        # Decanter is usually initialized with calibration data (df).
-        # But typically we want the bounds of the valid data.
-        t_min, t_max = np.min(self.T), np.max(self.T)
-
-        dist_to_edge = min(t_target - t_min, t_max - t_target)
-
-        # If we are closer to edge than windowY, expand window to maintain support
-        # logic: if dist < h, new_h = h + (h - dist) = 2h - dist
-        if dist_to_edge < h_time:
-             h_time = 2 * h_time - dist_to_edge
+        # Edge Adjustment removed here as it is handled in fit_local_model
+        # But wait, if get_weights is called directly (not via fit_local_model), we might want it?
+        # Typically get_weights is internal.
+        # But we loop fit_local_model calling get_weights.
+        # fit_local_model applies edge adjustment logic to h_time before loop.
+        # So we should use the passed h_time directly here.
+        pass
 
         # 1. Time Distance
         dist_t = self.T - t_target
@@ -177,29 +168,97 @@ class Decanter:
 
         return W
 
-    def fit_local_model(self, t_target, q_target, s_target, h_params, extras_target=None):
+    def fit_local_model(self, t_target, q_target, s_target, h_params, extras_target=None, min_obs=100, min_uncen=50):
         """
         Performs Weighted Least Squares for a specific target point.
         Returns the coefficients.
         """
-        # Get weights
-        W = self.get_weights(t_target, q_target, s_target, h_params, extras_target)
+        # Iterative Window Expansion (EGRET Logic)
+        h_time = h_params.get('h_time', 7)
+        h_cov = h_params.get('h_cov', 2)
+        h_season = h_params.get('h_season', 0.5)
 
-        # Filter out zero-weight points to speed up matrix math
-        # Also ensure we only use valid (non-NaN) observations
-        valid_obs = ~np.isnan(self.Y)
-        mask = (W > 0) & valid_obs
+        # Determine edge-adjusted initial h_time (logic previously in get_weights, now here/loop)
+        # Note: get_weights implemented edge adjustment. But if we loop, we need to apply logic to temp h_time?
+        # EGRET applies edge adjustment logic to the initial h_time?
+        # run_WRTDS:
+        # distTime = min(distLow, distHigh)
+        # if (edgeAdjust) tempWindowY <- if (distTime > tempWindowY) tempWindowY else ((2 * tempWindowY) - distTime)
+        # Then loop: tempWindowY *= 1.1
+
+        # So I should handle edge adjustment logic here based on current h_time
+        t_min, t_max = np.min(self.T), np.max(self.T)
+        dist_to_edge = min(t_target - t_min, t_max - t_target)
+
+        # Initial adjustment
+        if dist_to_edge < h_time:
+             h_time = 2 * h_time - dist_to_edge
+
+        # Loop
+        max_iter = 100
+        for _ in range(max_iter):
+            # Calculate weights
+            # We call _tricube directly or get_weights?
+            # get_weights has the combination logic.
+            # But get_weights currently has edge adjustment logic baked in.
+            # I should refactor get_weights to take explicit h values, or pass params.
+            # Passing params is cleaner.
+
+            curr_params = h_params.copy()
+            curr_params['h_time'] = h_time
+            curr_params['h_cov'] = h_cov
+            curr_params['h_season'] = h_season
+            # Note: extra covariates h params are not expanded in EGRET? EGRET doesn't have them.
+            # We will keep them fixed or expand? Let's keep fixed for now.
+
+            # Temporarily disable edge adjustment in get_weights because we handled it?
+            # Or assume get_weights re-calculates edge adjustment?
+            # If we update h_time here, get_weights will apply edge adjustment to the NEW h_time?
+            # EGRET: `tempWindowY` is the state.
+            # `run_WRTDS` sets `tempWindowY` (possibly edge adjusted) at start.
+            # Then loop multiplies `tempWindowY`.
+            # So edge adjustment happens ONCE at start.
+            # My `get_weights` calculates edge adjustment dynamically based on passed `h_time`.
+            # If I pass `h_time` that is already adjusted (or not), `get_weights` will adjust it AGAIN?
+            # Yes, currently `get_weights` logic: `if dist < h_time: h_time = ...`.
+            # If I want to control it here, I should modify `get_weights` to NOT do it, or pass a flag.
+            # Or rely on `get_weights` doing it correctly for every iteration?
+            # EGRET: `tempWindowY` grows. The "edge adjustment" is just initializing `tempWindowY` to a larger value if near edge.
+            # The expansion is multiplicative on that larger value.
+            # If `get_weights` recalculates:
+            # Iter 1: h=7. Dist=1. New_h = 13.
+            # Iter 2: h=7.7. Dist=1. New_h = 2*7.7 - 1 = 14.4.
+            # 13 * 1.1 = 14.3. Close.
+            # So letting `get_weights` handle it seems fine/consistent.
+
+            W = self.get_weights(t_target, q_target, s_target, curr_params, extras_target)
+
+            valid_obs = ~np.isnan(self.Y)
+            mask = (W > 0) & valid_obs
+
+            num_pos_wt = np.sum(mask)
+            # Assuming all valid obs are "Uncen" for now (since we don't track censoring column explicitly yet)
+            num_uncen = num_pos_wt
+
+            if num_pos_wt >= min_obs and num_uncen >= min_uncen:
+                break
+
+            # Expand
+            h_time *= 1.1
+            h_cov *= 1.1
+            if h_season < 0.5:
+                h_season = min(h_season * 1.1, 0.5)
+
+        # Proceed with WLS
+        weights_active = W[mask]
+        y_active = self.Y[mask]
 
         # Dimension of model: 5 (Standard) + N_extras
         n_extras = self.X_extras.shape[1] if self.X_extras is not None else 0
         n_params = 5 + n_extras
 
-        # Heuristic: Need at least 2 * params data points? Or just > params
         if np.sum(mask) < max(10, n_params + 2):
-            return None
-
-        weights_active = W[mask]
-        y_active = self.Y[mask]
+             return None
 
         # Construct Design Matrix X for the active points
         # 1, ln(c0), t, sin, cos, [extra1, extra2...]
@@ -283,7 +342,7 @@ class Decanter:
 
         return np.exp(prediction_log) * bias
 
-    def compute_grid(self, h_params, n_t=None, n_q=None, n_extra=7):
+    def compute_grid(self, h_params, n_t=None, n_q=None, n_extra=7, min_obs=100):
         """
         Computes the regression surfaces (betas) on a regular grid.
         Returns a tuple of (grid_axes_tuple, betas_grid)
@@ -372,7 +431,7 @@ class Decanter:
 
             s_val = t_val % 1
 
-            betas = self.fit_local_model(t_val, q_val, s_val, h_params, extras_val)
+            betas = self.fit_local_model(t_val, q_val, s_val, h_params, extras_val, min_obs=min_obs)
 
             if betas is not None:
                 betas_grid[indices] = betas
@@ -389,6 +448,10 @@ class Decanter:
         # If we already have a grid and it matches (assuming h_params unchanged if not checking),
         # but for safety we recompute if called via public methods unless explicitly managed.
         # But here we just compute.
+
+        # grid_config might contain min_obs?
+        # Typically grid_config has n_t, n_q. min_obs is usually separate or in grid_config?
+        # Let's support passing min_obs via grid_config if present, or default.
 
         self.grid_axes, self.betas_grid = self.compute_grid(h_params, **grid_config)
         self.h_params_last = h_params
@@ -460,14 +523,19 @@ class Decanter:
         # Rebuild interpolators
         self._build_interpolators_from_grid()
 
-    def get_estimated_series(self, h_params, use_grid=False, grid_config={'n_t':None, 'n_q':None}):
+    def get_estimated_series(self, h_params, use_grid=False, grid_config={'n_t':None, 'n_q':None}, min_obs=100):
         """
         Returns the model predictions (in log space) for the observed data points.
         This represents the "trend + seasonality + flow effect" component.
         """
+        # Inject min_obs into grid_config if using grid
         if use_grid:
+            gc = grid_config.copy()
+            if 'min_obs' not in gc:
+                gc['min_obs'] = min_obs
+
             if self.interpolators is None:
-                self._prepare_grid_interpolators(h_params, grid_config)
+                self._prepare_grid_interpolators(h_params, gc)
 
             # Vectorized Interpolation
             # Construct points array (N, D)
@@ -511,7 +579,7 @@ class Decanter:
                 if self.X_extras is not None:
                     extras_current = self.X_extras[i, :]
 
-                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
+                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current, min_obs=min_obs)
 
                 if betas is None:
                     preds_log.append(np.nan)
@@ -522,7 +590,7 @@ class Decanter:
 
             return np.array(preds_log)
 
-    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':None, 'n_q':None}, gfn_window=None, integration_scenarios=None):
+    def decant_series(self, h_params={'h_time':7, 'h_cov':2, 'h_season':0.5}, use_grid=False, grid_config={'n_t':None, 'n_q':None}, gfn_window=None, integration_scenarios=None, min_obs=100):
         """
         Generates the cleaned time series t1 (Flow Normalized).
         """
@@ -554,8 +622,12 @@ class Decanter:
 
         if use_grid:
             print(f"Starting Decanting Process (Method: Grid)...")
+            gc = grid_config.copy()
+            if 'min_obs' not in gc:
+                gc['min_obs'] = min_obs
+
             if self.interpolators is None:
-                self._prepare_grid_interpolators(h_params, grid_config)
+                self._prepare_grid_interpolators(h_params, gc)
 
             # 1. Vectorized Beta Interpolation
             cols = [self.T, self.Q]
@@ -751,7 +823,7 @@ class Decanter:
                 if self.X_extras is not None:
                     extras_current = self.X_extras[i, :]
 
-                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current)
+                betas = self.fit_local_model(t_current, q_current, s_current, h_params, extras_current, min_obs=min_obs)
 
                 if betas is None:
                     results.append(np.nan)
@@ -1033,7 +1105,7 @@ class Decanter:
 
         return df_results
 
-    def add_kalman_correction(self, estimated_log_series=None, h_params=None, rho=0.9, use_grid=False, grid_config={'n_t':None, 'n_q':None}):
+    def add_kalman_correction(self, estimated_log_series=None, h_params=None, rho=0.9, use_grid=False, grid_config={'n_t':None, 'n_q':None}, min_obs=100):
         """
         Applies WRTDS-Kalman correction (AR1 filtering of residuals).
 
@@ -1049,7 +1121,7 @@ class Decanter:
         if estimated_log_series is None:
              if h_params is None:
                  raise ValueError("Must provide either estimated_log_series or h_params")
-             estimated_log_series = self.get_estimated_series(h_params, use_grid, grid_config)
+             estimated_log_series = self.get_estimated_series(h_params, use_grid, grid_config, min_obs=min_obs)
 
         # Calculate residuals where we have observations
         # res = log_obs - log_model
