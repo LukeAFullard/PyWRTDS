@@ -210,7 +210,7 @@ class Decanter:
 
         return W
 
-    def fit_local_model(self, t_target, q_target, s_target, h_params, extras_target=None, min_obs=100, min_uncen=50):
+    def fit_local_model(self, t_target, q_target, s_target, h_params, extras_target=None, min_obs=100, min_uncen=50, verbose=False):
         """
         Performs Weighted Least Squares for a specific target point.
         Returns the coefficients.
@@ -283,6 +283,8 @@ class Decanter:
             num_uncen = num_pos_wt
 
             if num_pos_wt >= min_obs and num_uncen >= min_uncen:
+                if verbose:
+                    print(f"Converged at iter {_}: n_pos={num_pos_wt}, h_t={h_time:.2f}, h_q={h_cov:.2f}, h_s={h_season:.2f}")
                 break
 
             # Expand
@@ -290,6 +292,9 @@ class Decanter:
             h_cov *= 1.1
             if h_season < 0.5:
                 h_season = min(h_season * 1.1, 0.5)
+        else:
+            if verbose:
+                print(f"Failed to converge after {max_iter} iterations. Last n_pos={num_pos_wt}")
 
         # Proceed with WLS
         weights_active = W[mask]
