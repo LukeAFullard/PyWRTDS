@@ -35,7 +35,13 @@ corr_fn = combined[col_fn_py].corr(combined[col_fn_R])
 rmse_est = np.sqrt(((combined[col_est_py] - combined[col_est_R])**2).mean())
 rmse_fn = np.sqrt(((combined[col_fn_py] - combined[col_fn_R])**2).mean())
 
+# Percentage RMSE (normalized by R result)
+prmse_est = np.sqrt((( (combined[col_est_py] - combined[col_est_R]) / combined[col_est_R] )**2).mean()) * 100
+prmse_fn = np.sqrt((( (combined[col_fn_py] - combined[col_fn_R]) / combined[col_fn_R] )**2).mean()) * 100
+
 print(f"Correlation (Estimated): {corr_est:.4f}")
 print(f"Correlation (FN): {corr_fn:.4f}")
 print(f"RMSE (Estimated): {rmse_est:.4f}")
 print(f"RMSE (FN): {rmse_fn:.4f}")
+print(f"PRMSE (Estimated): {prmse_est:.2f}%")
+print(f"PRMSE (FN): {prmse_fn:.2f}%")
