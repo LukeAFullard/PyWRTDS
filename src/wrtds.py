@@ -315,7 +315,9 @@ class Decanter:
                  sse = np.sum((y_w - X_w @ betas)**2)
 
             # Degrees of freedom
-            dof = n_active - n_params
+            # EGRET uses survreg which performs MLE, using N instead of N-p for variance.
+            # To match EGRET exactly, we use dof = n_active.
+            dof = n_active
             if dof > 0:
                 sigma = np.sqrt(sse / dof)
             else:
