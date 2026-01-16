@@ -51,10 +51,36 @@ def run_validation():
     print("\nRunning Wild Bootstrap (n=10)...")
     res_wild = dec.bootstrap_uncertainty(h_params, n_bootstraps=10, method='wild', use_grid=True, grid_config=grid_config)
 
-    if (res_wild['p05'] <= res_wild['mean']).all() and (res_wild['mean'] <= res_wild['p95']).all():
+    # Report
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+    report_path = os.path.join(root_dir, 'reports', 'validation_uncertainty.md')
+
+    lines = []
+    lines.append("# Uncertainty (Bootstrap) Validation Report")
+    lines.append("")
+    lines.append("## Methodology")
+    lines.append("Ran Block and Wild Bootstrap (n=10) on synthetic data.")
+    lines.append("")
+    lines.append("## Results")
+
+    # Check consistency
+    block_ok = (res_block['p05'] <= res_block['mean']).all() and (res_block['mean'] <= res_block['p95']).all()
+    wild_ok = (res_wild['p05'] <= res_wild['mean']).all() and (res_wild['mean'] <= res_wild['p95']).all()
+
+    lines.append(f"- **Block Bootstrap:** {'Consistent' if block_ok else 'Inconsistent'}")
+    lines.append(f"- **Wild Bootstrap:** {'Consistent' if wild_ok else 'Inconsistent'}")
+    lines.append("")
+
+    if block_ok and wild_ok:
+        lines.append("**Conclusion:** SUCCESS. All bootstrap intervals are logically consistent.")
         print("SUCCESS: Wild Bootstrap bounds are consistent.")
     else:
+        lines.append("**Conclusion:** FAILURE. Inconsistent bounds detected.")
         print("FAILURE: Wild Bootstrap bounds are inconsistent.")
+
+    with open(report_path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"Report saved to {report_path}")
 
 if __name__ == "__main__":
     run_validation()

@@ -50,10 +50,33 @@ def run_validation():
     print(f"Mean High Q Conc:   {mean_high:.4f}")
 
     # Since C ~ Q^0.5, higher Q -> higher C
+
+    # Report
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+    report_path = os.path.join(root_dir, 'reports', 'validation_projection.md')
+
+    lines = []
+    lines.append("# WRTDS-P (Projection) Validation Report")
+    lines.append("")
+    lines.append("## Methodology")
+    lines.append("Synthetic data where Conc increases with Discharge (Q).")
+    lines.append("We compare a Baseline Scenario (Historical Q) vs a High Q Scenario (Q * 1.5).")
+    lines.append("")
+    lines.append("## Results")
+    lines.append(f"- **Mean Baseline Conc:** {mean_base:.4f}")
+    lines.append(f"- **Mean High Q Conc:**   {mean_high:.4f}")
+    lines.append("")
+
     if mean_high > mean_base:
+        lines.append("**Conclusion:** SUCCESS. High Q scenario correctly produced higher concentration.")
         print("SUCCESS: High Q scenario produced higher concentration.")
     else:
+        lines.append("**Conclusion:** FAILURE. High Q scenario did not produce higher concentration.")
         print("FAILURE: High Q scenario did not produce higher concentration.")
+
+    with open(report_path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"Report saved to {report_path}")
 
 if __name__ == "__main__":
     run_validation()

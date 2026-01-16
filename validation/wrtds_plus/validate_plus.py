@@ -77,10 +77,33 @@ def run_validation():
     rmse_plus = np.sqrt(np.mean((np.log(res_plus['estimated']) - np.log(df_test['Conc']))**2))
     print(f"WRTDSplus RMSE (Log): {rmse_plus:.4f}")
 
+    # Report
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+    report_path = os.path.join(root_dir, 'reports', 'validation_wrtds_plus.md')
+
+    lines = []
+    lines.append("# WRTDSplus Validation Report")
+    lines.append("")
+    lines.append("## Methodology")
+    lines.append("Synthetic data where Conc depends on Discharge (Q) and Temperature. Comparison of standard model (Q only) vs WRTDSplus (Q + Temp).")
+    lines.append("")
+    lines.append("## Results")
+    lines.append("| Model | RMSE (Log) |")
+    lines.append("| :--- | :--- |")
+    lines.append(f"| Standard WRTDS | {rmse_std:.4f} |")
+    lines.append(f"| WRTDSplus | {rmse_plus:.4f} |")
+    lines.append("")
+
     if rmse_plus < rmse_std:
+        lines.append("**Conclusion:** SUCCESS. WRTDSplus improved prediction by leveraging Temperature.")
         print("SUCCESS: WRTDSplus improved prediction by leveraging Temperature.")
     else:
+        lines.append("**Conclusion:** FAILURE. WRTDSplus did not improve prediction.")
         print("FAILURE: WRTDSplus did not improve prediction.")
+
+    with open(report_path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"Report saved to {report_path}")
 
 if __name__ == "__main__":
     run_validation()

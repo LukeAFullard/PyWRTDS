@@ -113,10 +113,34 @@ def run_validation():
     print(f"\nSlope Stationary (Conc/Year): {slope_stat_yr:.4f}")
     print(f"Slope GFN (Conc/Year):        {slope_gfn_yr:.4f}")
 
+    # Report
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+    report_path = os.path.join(root_dir, 'reports', 'validation_gfn.md')
+
+    lines = []
+    lines.append("# Generalized Flow Normalization (GFN) Validation Report")
+    lines.append("")
+    lines.append("## Methodology")
+    lines.append("Synthetic data with trending Discharge (Q) over 20 years. Concentration is proportional to Q.")
+    lines.append("Stationary FN should produce a flat line (removing Q trend). GFN should preserve the trend.")
+    lines.append("")
+    lines.append("## Results")
+    lines.append("| Method | Slope (Conc/Year) |")
+    lines.append("| :--- | :--- |")
+    lines.append(f"| Stationary | {slope_stat_yr:.4f} |")
+    lines.append(f"| GFN (5-yr) | {slope_gfn_yr:.4f} |")
+    lines.append("")
+
     if slope_gfn_yr > slope_stat_yr and abs(slope_stat_yr) < 0.1:
+        lines.append("**Conclusion:** SUCCESS. GFN preserved the trend, Stationary removed it.")
         print("SUCCESS: GFN preserved the upward trend driven by Q, while Stationary removed it.")
     else:
+        lines.append("**Conclusion:** FAILURE. Trends did not match expectations.")
         print("FAILURE: Trends did not match expectations.")
+
+    with open(report_path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"Report saved to {report_path}")
 
     # Cleanup
     if os.path.exists('temp_grid.pkl'):

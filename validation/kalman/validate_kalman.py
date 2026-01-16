@@ -214,10 +214,33 @@ def run_validation():
     print(f"Standard RMSE (Log): {rmse_std:.4f}")
     print(f"Kalman RMSE (Log):   {rmse_kal:.4f}")
 
+    # Report
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+    report_path = os.path.join(root_dir, 'reports', 'validation_kalman.md')
+
+    lines = []
+    lines.append("# WRTDS-Kalman Validation Report")
+    lines.append("")
+    lines.append("## Methodology")
+    lines.append("Used synthetic AR(1) autocorrelated data. Trained on sparse subset (every 10th day), predicted test days.")
+    lines.append("")
+    lines.append("## Results")
+    lines.append("| Model | RMSE (Log) |")
+    lines.append("| :--- | :--- |")
+    lines.append(f"| Standard WRTDS | {rmse_std:.4f} |")
+    lines.append(f"| WRTDS-Kalman | {rmse_kal:.4f} |")
+    lines.append("")
+
     if rmse_kal < rmse_std:
+        lines.append("**Conclusion:** SUCCESS. Kalman correction improved prediction accuracy.")
         print("SUCCESS: Kalman correction improved prediction.")
     else:
+        lines.append("**Conclusion:** FAILURE. Kalman correction did not improve prediction.")
         print("FAILURE: Kalman correction did not improve prediction.")
+
+    with open(report_path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"Report saved to {report_path}")
 
 if __name__ == "__main__":
     run_validation()
