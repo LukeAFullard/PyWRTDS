@@ -628,8 +628,10 @@ class Decanter:
         self.extra_cov_config = state.get('extra_cov_config', [])
 
         # Restore historical distribution for integration
-        self.Q = state.get('history_Q')
-        self.X_extras = state.get('history_X_extras')
+        # Note: We do not overwrite self.Q / self.X_extras as they correspond to the current self.df
+        # We store them in case they are needed for fallback (though Seasonal FN requires dates which are not saved yet)
+        self.model_history_Q = state.get('history_Q')
+        self.model_history_X_extras = state.get('history_X_extras')
 
         # Rebuild interpolators
         self._build_interpolators_from_grid()
@@ -746,7 +748,7 @@ class Decanter:
             bias_factors = None
             const_part = None
 
-            if interp_method == 'coefficients' or (integration_scenarios is not None):
+            if interp_method == 'coefficients' or (integration_scenarios is not None) or (gfn_window is not None):
                 # Fallback to coefficients for scenarios if surface not implemented for scenarios yet
                 # Or simply always compute betas if we might need them.
                 # 1. Vectorized Beta Interpolation
