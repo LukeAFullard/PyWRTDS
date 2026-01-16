@@ -22,7 +22,7 @@ gfn_series = dec_daily.decant_series(h_params, use_grid=True, gfn_window=5.0)
 ```r
 # To verify against EGRET:
 # eList <- ...
-# dailyResults <- runSeries(eList, windowSide = 5.0, ...)
+# dailyResults <- runSeries(eList, windowSide = 2.5, ...)
 ```
 
 ## Results
@@ -30,5 +30,7 @@ gfn_series = dec_daily.decant_series(h_params, use_grid=True, gfn_window=5.0)
 | :--- | :--- |
 | Stationary | -0.0169 |
 | GFN (5-yr) | 0.4601 |
+
+**R Comparison:** RMSE = 0.4733
 
 **Conclusion:** SUCCESS. GFN preserved the trend, Stationary removed it.

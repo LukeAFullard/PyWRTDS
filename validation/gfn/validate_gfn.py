@@ -38,6 +38,12 @@ def run_validation():
     print("--- GFN Validation ---")
 
     df_daily, df_sample = generate_trending_q_data()
+    # Save data for R comparison
+    daily_path = os.path.join(os.path.dirname(__file__), 'gfn_data_daily.csv')
+    sample_path = os.path.join(os.path.dirname(__file__), 'gfn_data_sample.csv')
+    df_daily.to_csv(daily_path, index=False)
+    df_sample.to_csv(sample_path, index=False)
+
     print(f"Data: 20 years. Q is trending up. C-Q relationship is constant.")
 
     dec = Decanter(df_sample, 'Date', 'Conc', 'Q', daily_data=df_daily)
@@ -113,6 +119,26 @@ def run_validation():
     print(f"\nSlope Stationary (Conc/Year): {slope_stat_yr:.4f}")
     print(f"Slope GFN (Conc/Year):        {slope_gfn_yr:.4f}")
 
+    # Compare with R if available
+    r_path = os.path.join(os.path.dirname(__file__), 'r_results_gfn.csv')
+    r_rmse = None
+    if os.path.exists(r_path):
+        print("\nLoading R Results for GFN...")
+        df_r = pd.read_csv(r_path)
+        # Assuming R output 'FNConc' corresponds to GFN series
+        # We need to ensure alignment. Python 'decant_series' returns array aligned with dec_daily.df
+
+        # Check lengths
+        if len(df_r) == len(gfn_series):
+            # Calculate RMSE
+            # R's 'FNConc' from runSeries is the flow normalized value
+            r_vals = df_r['FNConc'].values
+            rmse = np.sqrt(np.nanmean((gfn_series - r_vals)**2))
+            r_rmse = rmse
+            print(f"RMSE vs R (GFN): {rmse:.4f}")
+        else:
+            print(f"Warning: R results length {len(df_r)} != Python length {len(gfn_series)}")
+
     # Report
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
     report_path = os.path.join(root_dir, 'reports', 'validation_gfn.md')
@@ -142,7 +168,7 @@ def run_validation():
     lines.append("```r")
     lines.append("# To verify against EGRET:")
     lines.append("# eList <- ...")
-    lines.append("# dailyResults <- runSeries(eList, windowSide = 5.0, ...)")
+    lines.append("# dailyResults <- runSeries(eList, windowSide = 2.5, ...)")
     lines.append("```")
     lines.append("")
     lines.append("## Results")
@@ -151,6 +177,10 @@ def run_validation():
     lines.append(f"| Stationary | {slope_stat_yr:.4f} |")
     lines.append(f"| GFN (5-yr) | {slope_gfn_yr:.4f} |")
     lines.append("")
+
+    if r_rmse is not None:
+        lines.append(f"**R Comparison:** RMSE = {r_rmse:.4f}")
+        lines.append("")
 
     if slope_gfn_yr > slope_stat_yr and abs(slope_stat_yr) < 0.1:
         lines.append("**Conclusion:** SUCCESS. GFN preserved the trend, Stationary removed it.")
