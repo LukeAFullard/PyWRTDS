@@ -29,8 +29,8 @@ gfn_series = dec_daily.decant_series(h_params, use_grid=True, gfn_window=5.0)
 | Method | Slope (Conc/Year) |
 | :--- | :--- |
 | Stationary | -0.0169 |
-| GFN (5-yr) | 0.4601 |
+| GFN (5-yr) | 0.4699 |
 
-**R Comparison:** RMSE = 0.4733
+**R Comparison:** RMSE = 0.5053
 
 **Conclusion:** SUCCESS. GFN preserved the trend, Stationary removed it.
