@@ -920,33 +920,69 @@ class Decanter:
                     return results
 
             else:
-                # Case B: GFN (Windowed) - Integration set changes per row
-                # We have pre-computed betas, but we must loop for integration
-                # to select the window.
-                h_window = gfn_window / 2
-                results = []
-                n = len(self.df)
+                # Case B: GFN (Windowed)
+                # EGRET Methodology:
+                # 1. Select subset of history within window (t +/- h).
+                # 2. Within that subset, group Qs by Day of Year (Seasonally Stationary within Window).
+                # 3. Integrate over the specific DOY distribution from the window.
 
-                for i in range(n):
+                # We need source data (Daily History)
+                if self.daily_history is not None:
+                    source_df = self.daily_history
+                    doy_hist = get_adjusted_doy(source_df['date'])
+                    source_Q = source_df['log_covariate'].values
+                    source_T = source_df['decimal_time'].values
+                    if self.X_extras is not None:
+                         extras_cols = [self.daily_history[col].values for col in self.extra_cov_names]
+                         source_Extras = np.column_stack(extras_cols)
+                    else:
+                         source_Extras = None
+                else:
+                    doy_hist = get_adjusted_doy(self.df[self.orig_date_col])
+                    source_Q = self.Q
+                    source_T = self.T
+                    source_Extras = self.X_extras
+
+                # Target DOYs
+                doy_target = get_adjusted_doy(self.df[self.orig_date_col])
+
+                h_window = gfn_window / 2.0
+                results = np.full(len(self.df), np.nan)
+
+                # We must iterate row by row because the window moves
+                for i in range(len(self.df)):
                     if np.isnan(all_betas[i, 0]):
-                        results.append(np.nan)
                         continue
 
                     t_curr = self.T[i]
-                    # Select window
-                    # This boolean masking is somewhat slow but much faster than fitting
-                    mask = np.abs(self.T - t_curr) <= h_window
+                    d_curr = doy_target[i]
 
-                    if not np.any(mask):
-                        # Fallback to full record if empty window
-                        Q_local = self.Q
-                        Extras_local = self.X_extras
+                    # 1. Window Mask
+                    mask_window = np.abs(source_T - t_curr) <= h_window
+
+                    # 2. DOY Mask within Window
+                    # We need indices in source_T where mask_window is True AND doy_hist matches d_curr
+                    # Note: EGRET handles Feb 29 (60) by pooling with Feb 28 (59)
+                    if d_curr == 59 or d_curr == 60:
+                        mask_doy = (doy_hist == 59) | (doy_hist == 60)
                     else:
-                        Q_local = self.Q[mask]
-                        Extras_local = self.X_extras[mask, :] if self.X_extras is not None else None
+                        mask_doy = (doy_hist == d_curr)
 
-                    # Calculate mean
-                    # const_part[i] + beta1[i]*Q + ...
+                    final_mask = mask_window & mask_doy
+
+                    # If no match in window (rare), fallback to full window? or full record?
+                    # EGRET would likely return NA or use what's available.
+                    if np.sum(final_mask) == 0:
+                        # Fallback to just window (smear seasonality)
+                        final_mask = mask_window
+
+                    if np.sum(final_mask) == 0:
+                        continue
+
+                    Q_local = source_Q[final_mask]
+                    Extras_local = source_Extras[final_mask, :] if source_Extras is not None else None
+
+                    # Apply betas (at t_curr) to Q_local
                     pred_log = const_part[i] + all_betas[i, 1] * Q_local
 
                     if Extras_local is not None:
@@ -954,9 +990,11 @@ class Decanter:
                             pred_log += all_betas[i, 5 + k] * Extras_local[:, k]
 
                     pred_linear = np.exp(pred_log) * bias_factors[i]
-                    results.append(np.mean(pred_linear))
 
-                return np.array(results)
+                    # Mean (Stationary within window logic implies uniform weight for the day-distribution)
+                    results[i] = np.mean(pred_linear)
+
+                return results
 
         else:
             # Exact Method (Loop)
